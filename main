@@ -1,0 +1,1060 @@
+#!/bin/bash
+
+#############################################
+# n8n Automation Installer by Vinz
+# Advanced Installation & Management Script
+# Version: 5.0
+# Author: Vinz
+#############################################
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+BG_GREEN='\033[42m'
+BG_RED='\033[41m'
+BG_BLUE='\033[44m'
+
+# Unicode characters
+CHECK="✓"
+CROSS="✗"
+ARROW="➜"
+STAR="★"
+DOT="•"
+PLAY="▶"
+STOP="■"
+RESTART="↻"
+INSTALL="⬇"
+UNINSTALL="🗑"
+SETTINGS="⚙"
+STATUS="📊"
+PORT="🔌"
+GLOBE="🌐"
+DOCKER="🐳"
+NODE="⬢"
+PM2="⚡"
+SYSTEMD="⚙"
+
+# Configuration file
+CONFIG_FILE="/etc/n8n-installer/config.conf"
+LOG_FILE="/var/log/n8n-installer-$(date +%Y%m%d-%H%M%S).log"
+INSTALL_LOCK="/etc/n8n-installer/.installed"
+
+# Create config directory
+mkdir -p /etc/n8n-installer
+
+# Redirect errors to log
+exec 2> >(tee -a "$LOG_FILE" >&2)
+
+# Detect OS
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_TYPE=$ID
+        OS_VERSION=$VERSION_ID
+        OS_PRETTY=$PRETTY_NAME
+    else
+        OS_TYPE="unknown"
+        OS_VERSION="unknown"
+        OS_PRETTY="Unknown OS"
+    fi
+}
+
+# Print header
+print_header() {
+    clear
+    echo ""
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}         ${MAGENTA}${BOLD}n8n ${WHITE}AUTOMATION ${GREEN}INSTALLER${NC}  ${DIM}v5.0${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                     ${YELLOW}by Vinz${NC}                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# Animated progress bar
+show_progress_bar() {
+    local current=$1
+    local total=$2
+    local task=$3
+    local width=40
+    
+    if [ $total -eq 0 ]; then
+        total=1
+    fi
+    
+    local percentage=$((current * 100 / total))
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+    
+    # Build progress bar
+    printf "\r  "
+    printf "${CYAN}[${NC}"
+    
+    # Filled part
+    if [ $filled -gt 0 ]; then
+        printf "${GREEN}"
+        printf "%${filled}s" | tr ' ' '█'
+    fi
+    
+    # Empty part
+    if [ $empty -gt 0 ]; then
+        printf "${GRAY}"
+        printf "%${empty}s" | tr ' ' '░'
+    fi
+    
+    printf "${NC}${CYAN}]${NC} "
+    printf "%3d%% " $percentage
+    
+    # Task description
+    if [ -n "$task" ]; then
+        printf "${WHITE}%s${NC}" "$task"
+    fi
+    
+    # Add newline if complete
+    if [ $percentage -eq 100 ]; then
+        echo ""
+    fi
+}
+
+# Animated spinner
+show_spinner() {
+    local pid=$1
+    local task=$2
+    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+    
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) % ${#spin} ))
+        printf "\r  ${CYAN}[${spin:$i:1}]${NC} %s" "$task"
+        sleep 0.1
+    done
+    
+    wait $pid
+    local result=$?
+    
+    if [ $result -eq 0 ]; then
+        printf "\r  ${GREEN}[${CHECK}]${NC} %s\n" "$task"
+    else
+        printf "\r  ${RED}[${CROSS}]${NC} %s\n" "$task"
+    fi
+    
+    return $result
+}
+
+# Check if n8n is installed
+is_n8n_installed() {
+    if [ -f "$INSTALL_LOCK" ] && [ -f "$CONFIG_FILE" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Load configuration
+load_config() {
+    if [[ -f $CONFIG_FILE ]]; then
+        source $CONFIG_FILE
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Save configuration
+save_config() {
+    cat > $CONFIG_FILE <<EOF
+INSTALL_METHOD=$INSTALL_METHOD
+N8N_PORT=$N8N_PORT
+N8N_DOMAIN=$N8N_DOMAIN
+N8N_PROTOCOL=$N8N_PROTOCOL
+N8N_USER=$N8N_USER
+N8N_HOME=$N8N_HOME
+N8N_VERSION=$N8N_VERSION
+WEBHOOK_URL=$WEBHOOK_URL
+INSTALL_DATE=$(date)
+EOF
+    touch $INSTALL_LOCK
+}
+
+# Get system stats
+get_system_stats() {
+    local cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "0")
+    local mem=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}' 2>/dev/null || echo "0")
+    local disk=$(df / | awk 'NR==2 {print $5}' | sed 's/%//' 2>/dev/null || echo "0")
+    echo "$cpu|$mem|$disk"
+}
+
+# Check service status
+check_n8n_status() {
+    if ! is_n8n_installed; then
+        echo "not_installed"
+        return
+    fi
+    
+    load_config
+    
+    case $INSTALL_METHOD in
+        docker)
+            if docker ps 2>/dev/null | grep -q n8n; then
+                echo "running"
+            elif docker ps -a 2>/dev/null | grep -q n8n; then
+                echo "stopped"
+            else
+                echo "not_found"
+            fi
+            ;;
+        pm2)
+            if pm2 list 2>/dev/null | grep -q n8n; then
+                if pm2 list 2>/dev/null | grep n8n | grep -q online; then
+                    echo "running"
+                else
+                    echo "stopped"
+                fi
+            else
+                echo "not_found"
+            fi
+            ;;
+        systemd)
+            if systemctl is-active n8n &>/dev/null; then
+                echo "running"
+            elif systemctl list-units --all 2>/dev/null | grep -q n8n.service; then
+                echo "stopped"
+            else
+                echo "not_found"
+            fi
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+# Main menu
+show_main_menu() {
+    while true; do
+        print_header
+        
+        # Get system stats
+        IFS='|' read -r cpu mem disk <<< "$(get_system_stats)"
+        local n8n_status=$(check_n8n_status)
+        local ip=$(hostname -I | awk '{print $1}')
+        
+        # Status bar
+        echo -e "${WHITE}SYSTEM STATUS${NC}"
+        echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+        
+        # System info in one line
+        printf "  CPU: "
+        if [ "${cpu%.*}" -gt 80 ]; then
+            printf "${RED}%s%%${NC}" "$cpu"
+        elif [ "${cpu%.*}" -gt 60 ]; then
+            printf "${YELLOW}%s%%${NC}" "$cpu"
+        else
+            printf "${GREEN}%s%%${NC}" "$cpu"
+        fi
+        
+        printf "  RAM: "
+        if [ "${mem%.*}" -gt 80 ]; then
+            printf "${RED}%s%%${NC}" "$mem"
+        elif [ "${mem%.*}" -gt 60 ]; then
+            printf "${YELLOW}%s%%${NC}" "$mem"
+        else
+            printf "${GREEN}%s%%${NC}" "$mem"
+        fi
+        
+        printf "  DISK: "
+        if [ "$disk" -gt 80 ]; then
+            printf "${RED}%s%%${NC}" "$disk"
+        elif [ "$disk" -gt 60 ]; then
+            printf "${YELLOW}%s%%${NC}" "$disk"
+        else
+            printf "${GREEN}%s%%${NC}" "$disk"
+        fi
+        
+        printf "  IP: ${CYAN}%s${NC}\n" "$ip"
+        
+        # n8n status
+        printf "  n8n: "
+        case $n8n_status in
+            running)
+                printf "${GREEN}● Running${NC}"
+                if load_config 2>/dev/null; then
+                    printf " (${CYAN}%s${NC} on port ${CYAN}%s${NC})" "$INSTALL_METHOD" "$N8N_PORT"
+                fi
+                ;;
+            stopped)
+                printf "${YELLOW}● Stopped${NC}"
+                if load_config 2>/dev/null; then
+                    printf " (${CYAN}%s${NC})" "$INSTALL_METHOD"
+                fi
+                ;;
+            not_installed)
+                printf "${GRAY}○ Not Installed${NC}"
+                ;;
+            *)
+                printf "${RED}● Error${NC}"
+                ;;
+        esac
+        echo ""
+        echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+        echo ""
+        
+        # Menu based on installation status
+        if [ "$n8n_status" = "not_installed" ]; then
+            # Installation menu
+            echo -e "${WHITE}INSTALLATION${NC}"
+            echo -e "  ${CYAN}[1]${NC} ${INSTALL} Quick Install"
+            echo -e "  ${CYAN}[2]${NC} ${SETTINGS} Custom Install"
+            echo ""
+            echo -e "${WHITE}TOOLS${NC}"
+            echo -e "  ${CYAN}[3]${NC} ${PORT} Port Check"
+            echo -e "  ${CYAN}[4]${NC} ${STATUS} System Info"
+            echo ""
+        else
+            # Management menu
+            echo -e "${WHITE}SERVICE CONTROL${NC}"
+            
+            if [ "$n8n_status" = "running" ]; then
+                echo -e "  ${CYAN}[1]${NC} ${STOP} Stop n8n"
+                echo -e "  ${CYAN}[2]${NC} ${RESTART} Restart n8n"
+            else
+                echo -e "  ${CYAN}[1]${NC} ${PLAY} Start n8n"
+                echo -e "  ${CYAN}[2]${NC} ${RESTART} Restart n8n"
+            fi
+            
+            echo ""
+            echo -e "${WHITE}MANAGEMENT${NC}"
+            echo -e "  ${CYAN}[3]${NC} ${SETTINGS} Change Settings"
+            echo -e "  ${CYAN}[4]${NC} ${UNINSTALL} Uninstall"
+            echo -e "  ${CYAN}[5]${NC} ${STATUS} View Logs"
+            echo ""
+            echo -e "${WHITE}TOOLS${NC}"
+            echo -e "  ${CYAN}[6]${NC} ${PORT} Port Check"
+            echo -e "  ${CYAN}[7]${NC} ${GLOBE} Test Access"
+            echo -e "  ${CYAN}[8]${NC} ${STATUS} System Info"
+            echo ""
+        fi
+        
+        echo -e "  ${CYAN}[0]${NC} Exit"
+        echo ""
+        echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+        
+        read -p "  Select: " choice
+        
+        if [ "$n8n_status" = "not_installed" ]; then
+            case $choice in
+                1) quick_install ;;
+                2) custom_install ;;
+                3) check_port ;;
+                4) system_info ;;
+                0) exit_script ;;
+                *) invalid_option ;;
+            esac
+        else
+            case $choice in
+                1) 
+                    if [ "$n8n_status" = "running" ]; then
+                        stop_n8n
+                    else
+                        start_n8n
+                    fi
+                    ;;
+                2) restart_n8n ;;
+                3) change_settings ;;
+                4) uninstall_menu ;;
+                5) view_logs ;;
+                6) check_port ;;
+                7) test_access ;;
+                8) system_info ;;
+                0) exit_script ;;
+                *) invalid_option ;;
+            esac
+        fi
+    done
+}
+
+# Quick install
+quick_install() {
+    print_header
+    echo -e "${WHITE}${BOLD}QUICK INSTALLATION${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    # Select installation method
+    echo -e "${WHITE}Select Installation Method:${NC}"
+    echo ""
+    
+    # Check what's available
+    local docker_status="${RED}Not Installed${NC}"
+    local node_status="${RED}Not Installed${NC}"
+    
+    if command -v docker &>/dev/null; then
+        docker_status="${GREEN}Installed${NC}"
+    fi
+    
+    if command -v node &>/dev/null; then
+        local node_ver=$(node -v | sed 's/v//' | cut -d. -f1)
+        if [ "$node_ver" -ge 18 ]; then
+            node_status="${GREEN}v$(node -v | sed 's/v//')${NC}"
+        else
+            node_status="${YELLOW}v$(node -v | sed 's/v//') (needs update)${NC}"
+        fi
+    fi
+    
+    echo -e "  ${CYAN}[1]${NC} ${DOCKER} Docker     ${GRAY}($docker_status)${NC}"
+    echo -e "  ${CYAN}[2]${NC} ${PM2} PM2        ${GRAY}(Node.js: $node_status)${NC}"
+    echo -e "  ${CYAN}[3]${NC} ${SYSTEMD} Systemd    ${GRAY}(Node.js: $node_status)${NC}"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " method_choice
+    
+    case $method_choice in
+        1) INSTALL_METHOD="docker" ;;
+        2) INSTALL_METHOD="pm2" ;;
+        3) INSTALL_METHOD="systemd" ;;
+        0) return ;;
+        *) 
+            echo -e "${RED}Invalid option${NC}"
+            sleep 2
+            return
+            ;;
+    esac
+    
+    # Set defaults
+    N8N_PORT="8000"
+    N8N_USER="n8n"
+    N8N_HOME="/home/n8n"
+    N8N_VERSION="latest"
+    N8N_DOMAIN=""
+    N8N_PROTOCOL="http"
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    WEBHOOK_URL="http://${SERVER_IP}:${N8N_PORT}/"
+    
+    echo ""
+    echo -e "${WHITE}Installation Configuration:${NC}"
+    echo -e "  Method: ${CYAN}${INSTALL_METHOD}${NC}"
+    echo -e "  Port: ${CYAN}${N8N_PORT}${NC}"
+    echo ""
+    
+    read -p "  Proceed? [Y/n]: " confirm
+    confirm=${confirm:-Y}
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+    
+    # Start installation
+    echo ""
+    echo -e "${WHITE}${BOLD}INSTALLATION PROGRESS${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    # Installation steps
+    local steps=()
+    local total_steps=0
+    
+    if [[ "$INSTALL_METHOD" == "docker" ]]; then
+        steps=("install_dependencies" "install_docker" "setup_n8n_docker" "configure_firewall")
+        total_steps=4
+    else
+        steps=("install_dependencies" "install_nodejs" "create_user" "install_n8n" "setup_service" "configure_firewall")
+        total_steps=6
+    fi
+    
+    local current=0
+    
+    for step in "${steps[@]}"; do
+        ((current++))
+        
+        case $step in
+            install_dependencies)
+                show_progress_bar $current $total_steps "Installing dependencies..."
+                install_dependencies_quiet &
+                show_spinner $! "Installing system packages"
+                ;;
+            install_docker)
+                show_progress_bar $current $total_steps "Installing Docker..."
+                install_docker_quiet &
+                show_spinner $! "Setting up Docker"
+                ;;
+            install_nodejs)
+                show_progress_bar $current $total_steps "Installing Node.js..."
+                install_nodejs_quiet &
+                show_spinner $! "Installing Node.js 18"
+                ;;
+            create_user)
+                show_progress_bar $current $total_steps "Creating user..."
+                create_n8n_user_quiet &
+                show_spinner $! "Setting up n8n user"
+                ;;
+            install_n8n)
+                show_progress_bar $current $total_steps "Installing n8n..."
+                if [[ "$INSTALL_METHOD" == "pm2" ]]; then
+                    install_pm2_quiet &
+                    show_spinner $! "Installing PM2"
+                fi
+                install_n8n_npm_quiet &
+                show_spinner $! "Installing n8n (this may take a while)"
+                ;;
+            setup_n8n_docker)
+                show_progress_bar $current $total_steps "Setting up n8n..."
+                setup_docker_container &
+                show_spinner $! "Creating n8n container"
+                ;;
+            setup_service)
+                show_progress_bar $current $total_steps "Configuring service..."
+                if [[ "$INSTALL_METHOD" == "pm2" ]]; then
+                    setup_pm2_service &
+                    show_spinner $! "Configuring PM2 service"
+                else
+                    setup_systemd_service &
+                    show_spinner $! "Configuring systemd service"
+                fi
+                ;;
+            configure_firewall)
+                show_progress_bar $current $total_steps "Configuring firewall..."
+                configure_firewall_quiet &
+                show_spinner $! "Opening port ${N8N_PORT}"
+                ;;
+        esac
+    done
+    
+    # Save configuration
+    save_config
+    
+    # Show completion
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}${BOLD}                    ${CHECK} INSTALLATION SUCCESSFUL!${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # Test connectivity
+    echo -e "${WHITE}Testing Installation:${NC}"
+    echo ""
+    
+    # Wait for service to start
+    local max_attempts=30
+    local attempt=0
+    
+    echo -n "  Waiting for n8n to start"
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -s -o /dev/null -w "%{http_code}" http://localhost:${N8N_PORT} 2>/dev/null | grep -q "200\|302"; then
+            echo -e " ${GREEN}${CHECK}${NC}"
+            break
+        fi
+        echo -n "."
+        sleep 1
+        ((attempt++))
+    done
+    
+    if [ $attempt -eq $max_attempts ]; then
+        echo -e " ${RED}${CROSS}${NC}"
+        echo -e "  ${YELLOW}Warning: n8n is not responding yet${NC}"
+    fi
+    
+    # Check port accessibility
+    echo -n "  Checking port accessibility"
+    if nc -zv localhost $N8N_PORT &>/dev/null; then
+        echo -e " ${GREEN}${CHECK}${NC}"
+    else
+        echo -e " ${RED}${CROSS}${NC}"
+    fi
+    
+    echo ""
+    echo -e "${WHITE}${BOLD}ACCESS INFORMATION${NC}"
+    echo -e "${CYAN}┌────────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC}                                                                    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  ${GLOBE} URL: ${GREEN}${BOLD}http://${SERVER_IP}:${N8N_PORT}${NC}                              ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}                                                                    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  Method: ${CYAN}${INSTALL_METHOD}${NC}                                              ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  Port: ${CYAN}${N8N_PORT}${NC}                                                    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  Status: ${GREEN}Active${NC}                                                  ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}                                                                    ${CYAN}│${NC}"
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Useful Commands:${NC}"
+    
+    case $INSTALL_METHOD in
+        docker)
+            echo -e "  Start:   ${CYAN}docker start n8n${NC}"
+            echo -e "  Stop:    ${CYAN}docker stop n8n${NC}"
+            echo -e "  Logs:    ${CYAN}docker logs n8n${NC}"
+            ;;
+        pm2)
+            echo -e "  Start:   ${CYAN}pm2 start n8n${NC}"
+            echo -e "  Stop:    ${CYAN}pm2 stop n8n${NC}"
+            echo -e "  Logs:    ${CYAN}pm2 logs n8n${NC}"
+            ;;
+        systemd)
+            echo -e "  Start:   ${CYAN}systemctl start n8n${NC}"
+            echo -e "  Stop:    ${CYAN}systemctl stop n8n${NC}"
+            echo -e "  Logs:    ${CYAN}journalctl -u n8n -f${NC}"
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Service control functions
+start_n8n() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}STARTING N8N SERVICE${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker start n8n &
+            show_spinner $! "Starting Docker container"
+            ;;
+        pm2)
+            pm2 start n8n &
+            show_spinner $! "Starting PM2 service"
+            ;;
+        systemd)
+            systemctl start n8n &
+            show_spinner $! "Starting systemd service"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${GREEN}Service started successfully!${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+stop_n8n() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}STOPPING N8N SERVICE${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n &
+            show_spinner $! "Stopping Docker container"
+            ;;
+        pm2)
+            pm2 stop n8n &
+            show_spinner $! "Stopping PM2 service"
+            ;;
+        systemd)
+            systemctl stop n8n &
+            show_spinner $! "Stopping systemd service"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${YELLOW}Service stopped${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+restart_n8n() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}RESTARTING N8N SERVICE${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker restart n8n &
+            show_spinner $! "Restarting Docker container"
+            ;;
+        pm2)
+            pm2 restart n8n &
+            show_spinner $! "Restarting PM2 service"
+            ;;
+        systemd)
+            systemctl restart n8n &
+            show_spinner $! "Restarting systemd service"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${GREEN}Service restarted successfully!${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Uninstall menu
+uninstall_menu() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}UNINSTALL N8N${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}${BOLD}WARNING: This will remove n8n from your system${NC}"
+    echo ""
+    echo -e "${WHITE}Current Installation:${NC}"
+    echo -e "  Method: ${CYAN}${INSTALL_METHOD}${NC}"
+    echo -e "  Port: ${CYAN}${N8N_PORT}${NC}"
+    echo -e "  Install Date: ${CYAN}${INSTALL_DATE}${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Uninstall Options:${NC}"
+    echo -e "  ${CYAN}[1]${NC} Complete Uninstall (remove everything)"
+    echo -e "  ${CYAN}[2]${NC} Keep Data (remove n8n but keep workflows)"
+    echo -e "  ${CYAN}[3]${NC} Backup & Uninstall"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " uninstall_choice
+    
+    case $uninstall_choice in
+        1) complete_uninstall ;;
+        2) uninstall_keep_data ;;
+        3) backup_and_uninstall ;;
+        0) return ;;
+        *) invalid_option ;;
+    esac
+}
+
+complete_uninstall() {
+    echo ""
+    echo -e "${RED}${BOLD}This will remove all n8n data!${NC}"
+    read -p "  Are you sure? Type 'yes' to confirm: " confirm
+    
+    if [ "$confirm" != "yes" ]; then
+        echo -e "${YELLOW}Uninstall cancelled${NC}"
+        sleep 2
+        return
+    fi
+    
+    echo ""
+    echo -e "${WHITE}${BOLD}UNINSTALLING N8N${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    # Stop service
+    echo "  Stopping service..."
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n 2>/dev/null
+            docker rm n8n 2>/dev/null
+            docker rmi n8nio/n8n 2>/dev/null
+            rm -rf /var/lib/n8n
+            ;;
+        pm2)
+            pm2 stop n8n 2>/dev/null
+            pm2 delete n8n 2>/dev/null
+            rm -rf "$N8N_HOME"
+            ;;
+        systemd)
+            systemctl stop n8n 2>/dev/null
+            systemctl disable n8n 2>/dev/null
+            rm -f /etc/systemd/system/n8n.service
+            rm -rf "$N8N_HOME"
+            ;;
+    esac
+    
+    # Remove config
+    rm -f $CONFIG_FILE
+    rm -f $INSTALL_LOCK
+    
+    echo ""
+    echo -e "${GREEN}${CHECK} n8n has been completely uninstalled${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+    exit 0
+}
+
+# Test access
+test_access() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}TESTING N8N ACCESS${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    local server_ip=$(hostname -I | awk '{print $1}')
+    local public_ip=$(curl -s ifconfig.me 2>/dev/null || echo "N/A")
+    
+    echo -e "${WHITE}Access URLs:${NC}"
+    echo -e "  Local:    ${CYAN}http://localhost:${N8N_PORT}${NC}"
+    echo -e "  Network:  ${CYAN}http://${server_ip}:${N8N_PORT}${NC}"
+    echo -e "  Public:   ${CYAN}http://${public_ip}:${N8N_PORT}${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Testing Connectivity:${NC}"
+    echo ""
+    
+    # Test local
+    echo -n "  Local connection: "
+    if curl -s -o /dev/null -w "%{http_code}" http://localhost:${N8N_PORT} 2>/dev/null | grep -q "200\|302"; then
+        echo -e "${GREEN}${CHECK} Working${NC}"
+    else
+        echo -e "${RED}${CROSS} Failed${NC}"
+    fi
+    
+    # Test port
+    echo -n "  Port ${N8N_PORT} status: "
+    if nc -zv localhost $N8N_PORT &>/dev/null; then
+        echo -e "${GREEN}${CHECK} Open${NC}"
+    else
+        echo -e "${RED}${CROSS} Closed${NC}"
+    fi
+    
+    # Test external
+    echo -n "  External access: "
+    response=$(curl -s -X POST https://ports.yougetsignal.com/check-port.php \
+        -d "remoteAddress=${public_ip}&portNumber=${N8N_PORT}" 2>/dev/null || echo "failed")
+    
+    if [[ "$response" == *"open"* ]]; then
+        echo -e "${GREEN}${CHECK} Accessible${NC}"
+    else
+        echo -e "${YELLOW}⚠ Not accessible from internet${NC}"
+        echo ""
+        echo -e "  ${DIM}Possible reasons:${NC}"
+        echo -e "  ${DIM}• Firewall blocking port ${N8N_PORT}${NC}"
+        echo -e "  ${DIM}• Router not forwarding port${NC}"
+        echo -e "  ${DIM}• ISP blocking incoming connections${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Installation functions (quiet versions)
+install_dependencies_quiet() {
+    if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+        apt-get update &>/dev/null
+        apt-get install -y curl wget git build-essential &>/dev/null
+    elif [[ "$OS_TYPE" == "centos" ]] || [[ "$OS_TYPE" == "rhel" ]]; then
+        yum update -y &>/dev/null
+        yum install -y curl wget git &>/dev/null
+    fi
+}
+
+install_docker_quiet() {
+    if ! command -v docker &>/dev/null; then
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh &>/dev/null
+        sh /tmp/get-docker.sh &>/dev/null
+        systemctl start docker
+        systemctl enable docker &>/dev/null
+    fi
+}
+
+install_nodejs_quiet() {
+    if ! command -v node &>/dev/null || [ $(node -v | sed 's/v//' | cut -d. -f1) -lt 18 ]; then
+        if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+            curl -fsSL https://deb.nodesource.com/setup_18.x | bash - &>/dev/null
+            apt-get install -y nodejs &>/dev/null
+        elif [[ "$OS_TYPE" == "centos" ]] || [[ "$OS_TYPE" == "rhel" ]]; then
+            curl -fsSL https://rpm.nodesource.com/setup_18.x | bash - &>/dev/null
+            yum install -y nodejs &>/dev/null
+        fi
+    fi
+}
+
+install_pm2_quiet() {
+    if ! command -v pm2 &>/dev/null; then
+        npm install -g pm2 &>/dev/null
+    fi
+}
+
+create_n8n_user_quiet() {
+    if ! id "$N8N_USER" &>/dev/null; then
+        useradd -m -d "$N8N_HOME" -s /bin/bash "$N8N_USER"
+    fi
+    mkdir -p "$N8N_HOME/.n8n"
+    chown -R "$N8N_USER:$N8N_USER" "$N8N_HOME"
+}
+
+install_n8n_npm_quiet() {
+    cd "$N8N_HOME"
+    sudo -u "$N8N_USER" npm init -y &>/dev/null
+    sudo -u "$N8N_USER" npm install n8n &>/dev/null
+}
+
+setup_docker_container() {
+    docker pull n8nio/n8n:latest &>/dev/null
+    docker run -d \
+        --name n8n \
+        --restart unless-stopped \
+        -p ${N8N_PORT}:5678 \
+        -v /var/lib/n8n:/home/node/.n8n \
+        n8nio/n8n:latest &>/dev/null
+}
+
+setup_pm2_service() {
+    cat > ${N8N_HOME}/ecosystem.config.js <<EOF
+module.exports = {
+  apps: [{
+    name: 'n8n',
+    script: '${N8N_HOME}/node_modules/n8n/bin/n8n',
+    env: {
+      N8N_PORT: ${N8N_PORT},
+      N8N_HOST: '0.0.0.0'
+    }
+  }]
+};
+EOF
+    chown ${N8N_USER}:${N8N_USER} ${N8N_HOME}/ecosystem.config.js
+    sudo -u ${N8N_USER} pm2 start ${N8N_HOME}/ecosystem.config.js &>/dev/null
+    sudo -u ${N8N_USER} pm2 save &>/dev/null
+}
+
+setup_systemd_service() {
+    cat > /etc/systemd/system/n8n.service <<EOF
+[Unit]
+Description=n8n - Workflow Automation Tool
+After=network.target
+
+[Service]
+Type=simple
+User=${N8N_USER}
+Group=${N8N_USER}
+WorkingDirectory=${N8N_HOME}
+Environment="N8N_PORT=${N8N_PORT}"
+Environment="N8N_HOST=0.0.0.0"
+ExecStart=${N8N_HOME}/node_modules/.bin/n8n
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable n8n &>/dev/null
+    systemctl start n8n
+}
+
+configure_firewall_quiet() {
+    if command -v ufw &>/dev/null; then
+        ufw allow ${N8N_PORT}/tcp &>/dev/null
+    elif command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --permanent --add-port=${N8N_PORT}/tcp &>/dev/null
+        firewall-cmd --reload &>/dev/null
+    fi
+}
+
+# Placeholder functions for menu items
+custom_install() {
+    echo "Custom installation - Coming soon"
+    sleep 2
+}
+
+change_settings() {
+    echo "Change settings - Coming soon"
+    sleep 2
+}
+
+view_logs() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}N8N LOGS${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker logs n8n --tail 50
+            ;;
+        pm2)
+            pm2 logs n8n --lines 50
+            ;;
+        systemd)
+            journalctl -u n8n -n 50 --no-pager
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+check_port() {
+    print_header
+    echo -e "${WHITE}${BOLD}PORT CHECK${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if load_config 2>/dev/null; then
+        local port=$N8N_PORT
+    else
+        read -p "  Enter port to check: " port
+    fi
+    
+    echo ""
+    echo -e "${WHITE}Checking port ${port}:${NC}"
+    echo ""
+    
+    # Local check
+    echo -n "  Local binding: "
+    if ss -tuln | grep -q ":$port "; then
+        echo -e "${GREEN}${CHECK} In use${NC}"
+    else
+        echo -e "${GRAY}○ Available${NC}"
+    fi
+    
+    # Firewall check
+    echo -n "  Firewall: "
+    if command -v ufw &>/dev/null && ufw status | grep -q "$port"; then
+        echo -e "${GREEN}${CHECK} Open${NC}"
+    elif command -v firewall-cmd &>/dev/null && firewall-cmd --list-ports | grep -q "$port"; then
+        echo -e "${GREEN}${CHECK} Open${NC}"
+    else
+        echo -e "${YELLOW}⚠ May be blocked${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+system_info() {
+    print_header
+    echo -e "${WHITE}${BOLD}SYSTEM INFORMATION${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "  OS: ${CYAN}${OS_PRETTY}${NC}"
+    echo -e "  Kernel: ${CYAN}$(uname -r)${NC}"
+    echo -e "  CPU: ${CYAN}$(lscpu | grep 'Model name' | sed 's/Model name://g' | xargs)${NC}"
+    echo -e "  Cores: ${CYAN}$(nproc)${NC}"
+    echo -e "  Memory: ${CYAN}$(free -h | awk '/^Mem:/ {print $2}')${NC}"
+    echo -e "  Disk: ${CYAN}$(df -h / | awk 'NR==2 {print $2}')${NC}"
+    echo -e "  Uptime: ${CYAN}$(uptime -p)${NC}"
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+invalid_option() {
+    echo -e "${RED}Invalid option${NC}"
+    sleep 1
+}
+
+exit_script() {
+    echo ""
+    echo -e "${GREEN}Thank you for using n8n Installer by Vinz!${NC}"
+    echo ""
+    exit 0
+}
+
+# Check root
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}This script must be run as root${NC}"
+    echo -e "${YELLOW}Please run: sudo $0${NC}"
+    exit 1
+fi
+
+# Main execution
+detect_os
+show_main_menu
