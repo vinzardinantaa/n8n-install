@@ -1,0 +1,2844 @@
+#!/bin/bash
+
+#############################################
+# n8n Automation Installer by Vinz
+# Advanced Installation & Management Script
+# Version: 6.0 - Production Ready
+# Author: Vinz
+# Default Port: 5678 (n8n standard)
+#############################################
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# Unicode characters
+CHECK="✓"
+CROSS="✗"
+ARROW="➜"
+STAR="★"
+DOT="•"
+PLAY="▶"
+STOP="■"
+RESTART="↻"
+INSTALL="⬇"
+UNINSTALL="🗑"
+SETTINGS="⚙"
+STATUS="📊"
+PORT="🔌"
+GLOBE="🌐"
+DOCKER="🐳"
+NODE="⬢"
+PM2="⚡"
+SYSTEMD="⚙"
+BACKUP="💾"
+UPDATE="🔄"
+SSL="🔒"
+INFO="ℹ"
+WARNING="⚠"
+
+# Configuration file paths
+CONFIG_FILE="/etc/n8n-installer/config.conf"
+LOG_FILE="/var/log/n8n-installer-$(date +%Y%m%d-%H%M%S).log"
+INSTALL_LOCK="/etc/n8n-installer/.installed"
+BACKUP_DIR="/var/backups/n8n"
+
+# Default values
+DEFAULT_PORT="5678"  # n8n default port
+DEFAULT_USER="n8n"
+DEFAULT_HOME="/home/n8n"
+
+# Create necessary directories
+mkdir -p /etc/n8n-installer
+mkdir -p $BACKUP_DIR
+
+# Redirect errors to log
+exec 2> >(tee -a "$LOG_FILE" >&2)
+
+# ============================================
+# SYSTEM DETECTION AND INITIALIZATION
+# ============================================
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_TYPE=$ID
+        OS_VERSION=$VERSION_ID
+        OS_PRETTY=$PRETTY_NAME
+    else
+        OS_TYPE="unknown"
+        OS_VERSION="unknown"
+        OS_PRETTY="Unknown OS"
+    fi
+}
+
+# ============================================
+# UI FUNCTIONS
+# ============================================
+
+print_header() {
+    clear
+    echo ""
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}         ${MAGENTA}${BOLD}n8n ${WHITE}AUTOMATION ${GREEN}INSTALLER${NC}  ${DIM}v6.0${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                     ${YELLOW}by Vinz${NC}                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                  ${DIM}Default Port: 5678${NC}                                 ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+show_progress_bar() {
+    local current=$1
+    local total=$2
+    local task=$3
+    local width=40
+    
+    if [ $total -eq 0 ]; then
+        total=1
+    fi
+    
+    local percentage=$((current * 100 / total))
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+    
+    printf "\r  "
+    printf "${CYAN}[${NC}"
+    
+    if [ $filled -gt 0 ]; then
+        printf "${GREEN}"
+        printf "%${filled}s" | tr ' ' '█'
+    fi
+    
+    if [ $empty -gt 0 ]; then
+        printf "${GRAY}"
+        printf "%${empty}s" | tr ' ' '░'
+    fi
+    
+    printf "${NC}${CYAN}]${NC} "
+    printf "%3d%% " $percentage
+    
+    if [ -n "$task" ]; then
+        printf "${WHITE}%s${NC}" "$task"
+    fi
+    
+    if [ $percentage -eq 100 ]; then
+        echo ""
+    fi
+}
+
+show_spinner() {
+    local pid=$1
+    local task=$2
+    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+    
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) % ${#spin} ))
+        printf "\r  ${CYAN}[${spin:$i:1}]${NC} %s" "$task"
+        sleep 0.1
+    done
+    
+    wait $pid
+    local result=$?
+    
+    if [ $result -eq 0 ]; then
+        printf "\r  ${GREEN}[${CHECK}]${NC} %s\n" "$task"
+    else
+        printf "\r  ${RED}[${CROSS}]${NC} %s\n" "$task"
+    fi
+    
+    return $result
+}
+
+prompt_with_default() {
+    local prompt=$1
+    local default=$2
+    local var_name=$3
+    
+    if [ -n "$default" ]; then
+        read -p "  $prompt [${CYAN}$default${NC}]: " input
+        eval "$var_name=\${input:-$default}"
+    else
+        read -p "  $prompt: " input
+        eval "$var_name=\$input"
+    fi
+}
+
+validate_port() {
+    local port=$1
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo -e "  ${RED}Error: Port must be a number${NC}"
+        return 1
+    fi
+    
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo -e "  ${RED}Error: Port must be between 1 and 65535${NC}"
+        return 1
+    fi
+    
+    if ss -tuln | grep -q ":$port "; then
+        echo -e "  ${YELLOW}${WARNING} Warning: Port $port is already in use${NC}"
+        read -p "  Continue anyway? [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+validate_domain() {
+    local domain=$1
+    
+    if [ -z "$domain" ]; then
+        return 0  # Empty domain is valid (optional)
+    fi
+    
+    # Basic domain validation
+    if [[ ! "$domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?\.[a-zA-Z]{2,}$ ]]; then
+        echo -e "  ${RED}Error: Invalid domain format${NC}"
+        return 1
+    fi
+    
+    # Check if domain resolves
+    if ! host "$domain" &>/dev/null; then
+        echo -e "  ${YELLOW}${WARNING} Warning: Domain does not resolve${NC}"
+        echo -e "  ${DIM}Make sure to configure DNS before enabling SSL${NC}"
+    fi
+    
+    return 0
+}
+
+invalid_option() {
+    echo -e "${RED}Invalid option${NC}"
+    sleep 1
+}
+
+exit_script() {
+    echo ""
+    echo -e "${GREEN}Thank you for using n8n Installer by Vinz!${NC}"
+    echo ""
+    exit 0
+}
+
+# ============================================
+# CONFIGURATION MANAGEMENT
+# ============================================
+
+is_n8n_installed() {
+    if [ -f "$INSTALL_LOCK" ] && [ -f "$CONFIG_FILE" ]; then
+        return 0
+    fi
+    return 1
+}
+
+load_config() {
+    if [[ -f $CONFIG_FILE ]]; then
+        source $CONFIG_FILE
+        return 0
+    else
+        return 1
+    fi
+}
+
+save_config() {
+    cat > $CONFIG_FILE <<EOF
+INSTALL_METHOD=$INSTALL_METHOD
+N8N_PORT=$N8N_PORT
+N8N_DOMAIN=$N8N_DOMAIN
+N8N_PROTOCOL=$N8N_PROTOCOL
+N8N_USER=$N8N_USER
+N8N_HOME=$N8N_HOME
+N8N_VERSION=$N8N_VERSION
+WEBHOOK_URL=$WEBHOOK_URL
+INSTALL_DATE=$(date)
+ENABLE_SSL=${ENABLE_SSL:-false}
+SSL_EMAIL=${SSL_EMAIL:-}
+BASIC_AUTH_USER=${BASIC_AUTH_USER:-}
+BASIC_AUTH_PASS=${BASIC_AUTH_PASS:-}
+EOF
+    touch $INSTALL_LOCK
+}
+
+# ============================================
+# SYSTEM MONITORING
+# ============================================
+
+get_system_stats() {
+    local cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "0")
+    local mem=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}' 2>/dev/null || echo "0")
+    local disk=$(df / | awk 'NR==2 {print $5}' | sed 's/%//' 2>/dev/null || echo "0")
+    echo "$cpu|$mem|$disk"
+}
+
+check_n8n_status() {
+    if ! is_n8n_installed; then
+        echo "not_installed"
+        return
+    fi
+    
+    load_config
+    
+    case $INSTALL_METHOD in
+        docker)
+            if docker ps 2>/dev/null | grep -q n8n; then
+                echo "running"
+            elif docker ps -a 2>/dev/null | grep -q n8n; then
+                echo "stopped"
+            else
+                echo "not_found"
+            fi
+            ;;
+        pm2)
+            if pm2 list 2>/dev/null | grep -q n8n; then
+                if pm2 list 2>/dev/null | grep n8n | grep -q online; then
+                    echo "running"
+                else
+                    echo "stopped"
+                fi
+            else
+                echo "not_found"
+            fi
+            ;;
+        systemd)
+            if systemctl is-active n8n &>/dev/null; then
+                echo "running"
+            elif systemctl list-units --all 2>/dev/null | grep -q n8n.service; then
+                echo "stopped"
+            else
+                echo "not_found"
+            fi
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+# ============================================
+# MAIN MENU
+# ============================================
+
+show_main_menu() {
+    while true; do
+        print_header
+        
+        # Get system stats
+        IFS='|' read -r cpu mem disk <<< "$(get_system_stats)"
+        local n8n_status=$(check_n8n_status)
+        local ip=$(hostname -I | awk '{print $1}')
+        
+        # Status bar
+        echo -e "${WHITE}SYSTEM STATUS${NC}"
+        echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+        
+        # System info
+        printf "  CPU: "
+        if [ "${cpu%.*}" -gt 80 ]; then
+            printf "${RED}%s%%${NC}" "$cpu"
+        elif [ "${cpu%.*}" -gt 60 ]; then
+            printf "${YELLOW}%s%%${NC}" "$cpu"
+        else
+            printf "${GREEN}%s%%${NC}" "$cpu"
+        fi
+        
+        printf "  RAM: "
+        if [ "${mem%.*}" -gt 80 ]; then
+            printf "${RED}%s%%${NC}" "$mem"
+        elif [ "${mem%.*}" -gt 60 ]; then
+            printf "${YELLOW}%s%%${NC}" "$mem"
+        else
+            printf "${GREEN}%s%%${NC}" "$mem"
+        fi
+        
+        printf "  DISK: "
+        if [ "$disk" -gt 80 ]; then
+            printf "${RED}%s%%${NC}" "$disk"
+        elif [ "$disk" -gt 60 ]; then
+            printf "${YELLOW}%s%%${NC}" "$disk"
+        else
+            printf "${GREEN}%s%%${NC}" "$disk"
+        fi
+        
+        printf "  IP: ${CYAN}%s${NC}\n" "$ip"
+        
+        # n8n status
+        printf "  n8n: "
+        case $n8n_status in
+            running)
+                printf "${GREEN}● Running${NC}"
+                if load_config 2>/dev/null; then
+                    printf " (${CYAN}%s${NC} on port ${CYAN}%s${NC})" "$INSTALL_METHOD" "$N8N_PORT"
+                fi
+                ;;
+            stopped)
+                printf "${YELLOW}● Stopped${NC}"
+                if load_config 2>/dev/null; then
+                    printf " (${CYAN}%s${NC})" "$INSTALL_METHOD"
+                fi
+                ;;
+            not_installed)
+                printf "${GRAY}○ Not Installed${NC}"
+                ;;
+            *)
+                printf "${RED}● Error${NC}"
+                ;;
+        esac
+        echo ""
+        echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+        echo ""
+        
+        # Menu based on installation status
+        if [ "$n8n_status" = "not_installed" ]; then
+            # Installation menu
+            echo -e "${WHITE}INSTALLATION${NC}"
+            echo -e "  ${CYAN}[1]${NC} ${INSTALL} Quick Install ${DIM}(with prompts)${NC}"
+            echo -e "  ${CYAN}[2]${NC} ${SETTINGS} Custom Install ${DIM}(advanced)${NC}"
+            echo ""
+            echo -e "${WHITE}TOOLS${NC}"
+            echo -e "  ${CYAN}[3]${NC} ${PORT} Port Check"
+            echo -e "  ${CYAN}[4]${NC} ${STATUS} System Info"
+            echo ""
+        else
+            # Management menu
+            echo -e "${WHITE}SERVICE CONTROL${NC}"
+            
+            if [ "$n8n_status" = "running" ]; then
+                echo -e "  ${CYAN}[1]${NC} ${STOP} Stop n8n"
+                echo -e "  ${CYAN}[2]${NC} ${RESTART} Restart n8n"
+            else
+                echo -e "  ${CYAN}[1]${NC} ${PLAY} Start n8n"
+                echo -e "  ${CYAN}[2]${NC} ${RESTART} Restart n8n"
+            fi
+            
+            echo ""
+            echo -e "${WHITE}MANAGEMENT${NC}"
+            echo -e "  ${CYAN}[3]${NC} ${SETTINGS} Change Settings"
+            echo -e "  ${CYAN}[4]${NC} ${UNINSTALL} Uninstall"
+            echo -e "  ${CYAN}[5]${NC} ${STATUS} View Logs"
+            echo -e "  ${CYAN}[6]${NC} ${BACKUP} Backup/Restore"
+            echo -e "  ${CYAN}[7]${NC} ${UPDATE} Update n8n"
+            echo ""
+            echo -e "${WHITE}TOOLS${NC}"
+            echo -e "  ${CYAN}[8]${NC} ${PORT} Port Check"
+            echo -e "  ${CYAN}[9]${NC} ${GLOBE} Test Access"
+            echo -e "  ${CYAN}[10]${NC} ${STATUS} System Info"
+            echo -e "  ${CYAN}[11]${NC} ${SSL} SSL Certificate"
+            echo ""
+        fi
+        
+        echo -e "  ${CYAN}[0]${NC} Exit"
+        echo ""
+        echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+        
+        read -p "  Select: " choice
+        
+        if [ "$n8n_status" = "not_installed" ]; then
+            case $choice in
+                1) quick_install ;;
+                2) custom_install ;;
+                3) check_port ;;
+                4) system_info ;;
+                0) exit_script ;;
+                *) invalid_option ;;
+            esac
+        else
+            case $choice in
+                1) 
+                    if [ "$n8n_status" = "running" ]; then
+                        stop_n8n
+                    else
+                        start_n8n
+                    fi
+                    ;;
+                2) restart_n8n ;;
+                3) change_settings ;;
+                4) uninstall_menu ;;
+                5) view_logs ;;
+                6) backup_restore_menu ;;
+                7) update_n8n ;;
+                8) check_port ;;
+                9) test_access ;;
+                10) system_info ;;
+                11) ssl_menu ;;
+                0) exit_script ;;
+                *) invalid_option ;;
+            esac
+        fi
+    done
+}
+
+# ============================================
+# QUICK INSTALL (WITH CONFIRMATIONS)
+# ============================================
+
+quick_install() {
+    print_header
+    echo -e "${WHITE}${BOLD}QUICK INSTALLATION${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    # Step 1: Select installation method
+    echo -e "${WHITE}Select Installation Method:${NC}"
+    echo ""
+    
+    # Check what's available
+    local docker_status="${RED}Not Installed${NC}"
+    local node_status="${RED}Not Installed${NC}"
+    
+    if command -v docker &>/dev/null; then
+        docker_status="${GREEN}Installed${NC}"
+    fi
+    
+    if command -v node &>/dev/null; then
+        local node_ver=$(node -v | sed 's/v//' | cut -d. -f1)
+        if [ "$node_ver" -ge 18 ]; then
+            node_status="${GREEN}v$(node -v | sed 's/v//')${NC}"
+        else
+            node_status="${YELLOW}v$(node -v | sed 's/v//') (needs update)${NC}"
+        fi
+    fi
+    
+    echo -e "  ${CYAN}[1]${NC} ${DOCKER} Docker     ${GRAY}($docker_status)${NC} ${GREEN}[Recommended]${NC}"
+    echo -e "  ${CYAN}[2]${NC} ${PM2} PM2        ${GRAY}(Node.js: $node_status)${NC}"
+    echo -e "  ${CYAN}[3]${NC} ${SYSTEMD} Systemd    ${GRAY}(Node.js: $node_status)${NC}"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " method_choice
+    
+    case $method_choice in
+        1) INSTALL_METHOD="docker" ;;
+        2) INSTALL_METHOD="pm2" ;;
+        3) INSTALL_METHOD="systemd" ;;
+        0) return ;;
+        *) 
+            echo -e "${RED}Invalid option${NC}"
+            sleep 2
+            return
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${GREEN}${CHECK}${NC} Method: ${CYAN}${INSTALL_METHOD}${NC}"
+    echo ""
+    
+    # Step 2: Port configuration
+    echo -e "${WHITE}Port Configuration:${NC}"
+    echo -e "  ${INFO} n8n default port is ${CYAN}5678${NC}"
+    echo ""
+    
+    while true; do
+        prompt_with_default "Enter port for n8n" "$DEFAULT_PORT" "N8N_PORT"
+        
+        if validate_port "$N8N_PORT"; then
+            echo -e "  ${GREEN}${CHECK} Port $N8N_PORT configured${NC}"
+            break
+        fi
+    done
+    
+    echo ""
+    
+    # Step 3: Domain configuration (optional)
+    echo -e "${WHITE}Domain Configuration (Optional):${NC}"
+    echo -e "  ${INFO} Leave empty to skip domain setup"
+    echo ""
+    
+    prompt_with_default "Enter domain name" "" "N8N_DOMAIN"
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        if validate_domain "$N8N_DOMAIN"; then
+            echo -e "  ${GREEN}${CHECK} Domain configured: ${CYAN}${N8N_DOMAIN}${NC}"
+            
+            # Ask for SSL
+            echo ""
+            read -p "  Enable SSL with Let's Encrypt? [Y/n]: " enable_ssl
+            enable_ssl=${enable_ssl:-Y}
+            
+            if [[ "$enable_ssl" =~ ^[Yy]$ ]]; then
+                ENABLE_SSL="true"
+                N8N_PROTOCOL="https"
+                
+                while true; do
+                    prompt_with_default "Email for SSL certificate" "" "SSL_EMAIL"
+                    if [ -n "$SSL_EMAIL" ]; then
+                        if [[ "$SSL_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                            echo -e "  ${GREEN}${CHECK} SSL will be configured${NC}"
+                            break
+                        else
+                            echo -e "  ${RED}Invalid email format${NC}"
+                        fi
+                    else
+                        echo -e "  ${RED}Email is required for SSL${NC}"
+                    fi
+                done
+            else
+                ENABLE_SSL="false"
+                N8N_PROTOCOL="http"
+            fi
+        else
+            N8N_DOMAIN=""
+        fi
+    else
+        N8N_PROTOCOL="http"
+        ENABLE_SSL="false"
+    fi
+    
+    # Set remaining configuration
+    if [[ "$INSTALL_METHOD" != "docker" ]]; then
+        N8N_USER="$DEFAULT_USER"
+        N8N_HOME="$DEFAULT_HOME"
+    else
+        N8N_USER="root"  # Docker runs as root to avoid permission issues
+        N8N_HOME="/var/lib/n8n"
+    fi
+    
+    N8N_VERSION="latest"
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        WEBHOOK_URL="${N8N_PROTOCOL}://${N8N_DOMAIN}/"
+    else
+        WEBHOOK_URL="http://${SERVER_IP}:${N8N_PORT}/"
+    fi
+    
+    # Show summary
+    echo ""
+    echo -e "${WHITE}${BOLD}INSTALLATION SUMMARY${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "  Method:      ${CYAN}${INSTALL_METHOD}${NC}"
+    echo -e "  Port:        ${CYAN}${N8N_PORT}${NC}"
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        echo -e "  Domain:      ${CYAN}${N8N_DOMAIN}${NC}"
+        echo -e "  SSL:         ${CYAN}${ENABLE_SSL}${NC}"
+    fi
+    
+    echo -e "  Access URL:  ${CYAN}${WEBHOOK_URL}${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    read -p "  Proceed with installation? [Y/n]: " confirm
+    confirm=${confirm:-Y}
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "  ${YELLOW}Installation cancelled${NC}"
+        sleep 2
+        return
+    fi
+    
+    perform_installation
+}
+
+# ============================================
+# CUSTOM INSTALL (ADVANCED)
+# ============================================
+
+custom_install() {
+    print_header
+    echo -e "${WHITE}${BOLD}CUSTOM INSTALLATION${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    # Step 1: Select installation method
+    echo -e "${WHITE}Step 1: Select Installation Method${NC}"
+    echo ""
+    
+    local docker_status="${RED}Not Installed${NC}"
+    local node_status="${RED}Not Installed${NC}"
+    
+    if command -v docker &>/dev/null; then
+        docker_status="${GREEN}Installed${NC}"
+    fi
+    
+    if command -v node &>/dev/null; then
+        local node_ver=$(node -v | sed 's/v//' | cut -d. -f1)
+        if [ "$node_ver" -ge 18 ]; then
+            node_status="${GREEN}v$(node -v | sed 's/v//')${NC}"
+        else
+            node_status="${YELLOW}v$(node -v | sed 's/v//') (needs update)${NC}"
+        fi
+    fi
+    
+    echo -e "  ${CYAN}[1]${NC} ${DOCKER} Docker     ${GRAY}($docker_status)${NC}"
+    echo -e "  ${CYAN}[2]${NC} ${PM2} PM2        ${GRAY}(Node.js: $node_status)${NC}"
+    echo -e "  ${CYAN}[3]${NC} ${SYSTEMD} Systemd    ${GRAY}(Node.js: $node_status)${NC}"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " method_choice
+    
+    case $method_choice in
+        1) INSTALL_METHOD="docker" ;;
+        2) INSTALL_METHOD="pm2" ;;
+        3) INSTALL_METHOD="systemd" ;;
+        0) return ;;
+        *) 
+            echo -e "${RED}Invalid option${NC}"
+            sleep 2
+            return
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${GREEN}${CHECK}${NC} Method: ${CYAN}${INSTALL_METHOD}${NC}"
+    echo ""
+    
+    # Step 2: Configure port
+    echo -e "${WHITE}Step 2: Configure Port${NC}"
+    echo -e "  ${INFO} n8n default port is ${CYAN}5678${NC}"
+    echo ""
+    
+    while true; do
+        prompt_with_default "Enter port" "$DEFAULT_PORT" "N8N_PORT"
+        
+        if validate_port "$N8N_PORT"; then
+            echo -e "${GREEN}${CHECK}${NC} Port: ${CYAN}${N8N_PORT}${NC}"
+            break
+        fi
+    done
+    
+    echo ""
+    
+    # Step 3: Configure domain (optional)
+    echo -e "${WHITE}Step 3: Configure Domain (Optional)${NC}"
+    echo -e "  ${INFO} Required for SSL/HTTPS setup"
+    echo ""
+    
+    prompt_with_default "Enter domain name (leave empty to skip)" "" "N8N_DOMAIN"
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        if validate_domain "$N8N_DOMAIN"; then
+            echo -e "${GREEN}${CHECK}${NC} Domain: ${CYAN}${N8N_DOMAIN}${NC}"
+            N8N_PROTOCOL="https"
+            
+            # Step 4: SSL Configuration
+            echo ""
+            echo -e "${WHITE}Step 4: SSL Configuration${NC}"
+            echo ""
+            
+            read -p "  Enable automatic SSL with Let's Encrypt? [Y/n]: " enable_ssl
+            enable_ssl=${enable_ssl:-Y}
+            
+            if [[ "$enable_ssl" =~ ^[Yy]$ ]]; then
+                ENABLE_SSL="true"
+                
+                while true; do
+                    prompt_with_default "Email for SSL certificate" "" "SSL_EMAIL"
+                    if [ -n "$SSL_EMAIL" ]; then
+                        if [[ "$SSL_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                            echo -e "${GREEN}${CHECK}${NC} SSL: Enabled"
+                            break
+                        else
+                            echo -e "  ${RED}Invalid email format${NC}"
+                        fi
+                    else
+                        echo -e "  ${RED}Email is required for SSL${NC}"
+                    fi
+                done
+            else
+                ENABLE_SSL="false"
+                N8N_PROTOCOL="http"
+            fi
+        else
+            N8N_DOMAIN=""
+            N8N_PROTOCOL="http"
+            ENABLE_SSL="false"
+        fi
+    else
+        N8N_PROTOCOL="http"
+        ENABLE_SSL="false"
+    fi
+    
+    echo ""
+    
+    # Step 5: Authentication
+    echo -e "${WHITE}Step 5: Basic Authentication (Optional)${NC}"
+    echo -e "  ${INFO} Protect n8n with username/password"
+    echo ""
+    
+    read -p "  Enable authentication? [y/N]: " enable_auth
+    
+    if [[ "$enable_auth" =~ ^[Yy]$ ]]; then
+        while true; do
+            prompt_with_default "Username" "" "BASIC_AUTH_USER"
+            if [ -n "$BASIC_AUTH_USER" ]; then
+                break
+            else
+                echo -e "  ${RED}Username cannot be empty${NC}"
+            fi
+        done
+        
+        while true; do
+            read -s -p "  Password: " BASIC_AUTH_PASS
+            echo ""
+            if [ -n "$BASIC_AUTH_PASS" ]; then
+                read -s -p "  Confirm password: " confirm_pass
+                echo ""
+                if [ "$BASIC_AUTH_PASS" = "$confirm_pass" ]; then
+                    break
+                else
+                    echo -e "  ${RED}Passwords do not match${NC}"
+                fi
+            else
+                echo -e "  ${RED}Password cannot be empty${NC}"
+            fi
+        done
+        
+        echo -e "${GREEN}${CHECK}${NC} Authentication: Enabled"
+    fi
+    
+    echo ""
+    
+    # Step 6: Advanced options (for non-Docker)
+    if [[ "$INSTALL_METHOD" != "docker" ]]; then
+        echo -e "${WHITE}Step 6: Advanced Configuration${NC}"
+        echo ""
+        
+        prompt_with_default "n8n user" "$DEFAULT_USER" "N8N_USER"
+        prompt_with_default "n8n home directory" "$DEFAULT_HOME" "N8N_HOME"
+        
+        echo -e "${GREEN}${CHECK}${NC} User: ${CYAN}${N8N_USER}${NC}"
+        echo -e "${GREEN}${CHECK}${NC} Home: ${CYAN}${N8N_HOME}${NC}"
+    else
+        N8N_USER="root"  # Docker runs as root to avoid permission issues
+        N8N_HOME="/var/lib/n8n"
+    fi
+    
+    # Set remaining defaults
+    N8N_VERSION="latest"
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        WEBHOOK_URL="${N8N_PROTOCOL}://${N8N_DOMAIN}/"
+    else
+        WEBHOOK_URL="http://${SERVER_IP}:${N8N_PORT}/"
+    fi
+    
+    echo ""
+    echo -e "${WHITE}${BOLD}INSTALLATION SUMMARY${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "  Method:         ${CYAN}${INSTALL_METHOD}${NC}"
+    echo -e "  Port:           ${CYAN}${N8N_PORT}${NC}"
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        echo -e "  Domain:         ${CYAN}${N8N_DOMAIN}${NC}"
+        echo -e "  SSL:            ${CYAN}${ENABLE_SSL}${NC}"
+    fi
+    
+    if [ -n "$BASIC_AUTH_USER" ]; then
+        echo -e "  Authentication: ${CYAN}Enabled (User: ${BASIC_AUTH_USER})${NC}"
+    fi
+    
+    if [[ "$INSTALL_METHOD" != "docker" ]]; then
+        echo -e "  User:           ${CYAN}${N8N_USER}${NC}"
+        echo -e "  Directory:      ${CYAN}${N8N_HOME}${NC}"
+    fi
+    
+    echo -e "  Webhook URL:    ${CYAN}${WEBHOOK_URL}${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    read -p "  Proceed with installation? [Y/n]: " confirm
+    confirm=${confirm:-Y}
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "  ${YELLOW}Installation cancelled${NC}"
+        sleep 2
+        return
+    fi
+    
+    perform_installation
+}
+
+# ============================================
+# INSTALLATION PROCESS
+# ============================================
+
+perform_installation() {
+    echo ""
+    echo -e "${WHITE}${BOLD}INSTALLATION PROGRESS${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    local steps=()
+    local total_steps=0
+    
+    if [[ "$INSTALL_METHOD" == "docker" ]]; then
+        steps=("install_dependencies" "install_docker" "setup_n8n_docker" "configure_firewall")
+        total_steps=4
+        
+        if [ "$ENABLE_SSL" = "true" ] && [ -n "$N8N_DOMAIN" ]; then
+            steps+=("setup_nginx_ssl")
+            ((total_steps++))
+        fi
+    else
+        steps=("install_dependencies" "install_nodejs" "create_user" "install_n8n" "setup_service" "configure_firewall")
+        total_steps=6
+        
+        if [ "$ENABLE_SSL" = "true" ] && [ -n "$N8N_DOMAIN" ]; then
+            steps+=("setup_nginx_ssl")
+            ((total_steps++))
+        fi
+    fi
+    
+    local current=0
+    
+    for step in "${steps[@]}"; do
+        ((current++))
+        
+        case $step in
+            install_dependencies)
+                show_progress_bar $current $total_steps "Installing dependencies..."
+                install_dependencies_quiet &
+                show_spinner $! "Installing system packages"
+                ;;
+            install_docker)
+                show_progress_bar $current $total_steps "Installing Docker..."
+                install_docker_quiet &
+                show_spinner $! "Setting up Docker"
+                ;;
+            install_nodejs)
+                show_progress_bar $current $total_steps "Installing Node.js..."
+                install_nodejs_quiet &
+                show_spinner $! "Installing Node.js 18"
+                ;;
+            create_user)
+                show_progress_bar $current $total_steps "Creating user..."
+                create_n8n_user_quiet &
+                show_spinner $! "Setting up n8n user"
+                ;;
+            install_n8n)
+                show_progress_bar $current $total_steps "Installing n8n..."
+                if [[ "$INSTALL_METHOD" == "pm2" ]]; then
+                    install_pm2_quiet &
+                    show_spinner $! "Installing PM2"
+                fi
+                install_n8n_npm_quiet &
+                show_spinner $! "Installing n8n (this may take a while)"
+                ;;
+            setup_n8n_docker)
+                show_progress_bar $current $total_steps "Setting up n8n..."
+                setup_docker_container &
+                show_spinner $! "Creating n8n container"
+                ;;
+            setup_service)
+                show_progress_bar $current $total_steps "Configuring service..."
+                if [[ "$INSTALL_METHOD" == "pm2" ]]; then
+                    setup_pm2_service &
+                    show_spinner $! "Configuring PM2 service"
+                else
+                    setup_systemd_service &
+                    show_spinner $! "Configuring systemd service"
+                fi
+                ;;
+            configure_firewall)
+                show_progress_bar $current $total_steps "Configuring firewall..."
+                configure_firewall_quiet &
+                show_spinner $! "Opening port ${N8N_PORT}"
+                ;;
+            setup_nginx_ssl)
+                show_progress_bar $current $total_steps "Setting up SSL..."
+                setup_nginx_with_ssl &
+                show_spinner $! "Configuring Nginx with SSL"
+                ;;
+        esac
+    done
+    
+    save_config
+    show_installation_complete
+}
+
+show_installation_complete() {
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}${BOLD}                    ${CHECK} INSTALLATION SUCCESSFUL!${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Testing Installation:${NC}"
+    echo ""
+    
+    local max_attempts=30
+    local attempt=0
+    
+    echo -n "  Waiting for n8n to start"
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -s -o /dev/null -w "%{http_code}" http://localhost:${N8N_PORT} 2>/dev/null | grep -q "200\|302"; then
+            echo -e " ${GREEN}${CHECK}${NC}"
+            break
+        fi
+        echo -n "."
+        sleep 1
+        ((attempt++))
+    done
+    
+    if [ $attempt -eq $max_attempts ]; then
+        echo -e " ${RED}${CROSS}${NC}"
+        echo -e "  ${YELLOW}Warning: n8n is not responding yet${NC}"
+    fi
+    
+    echo -n "  Checking port accessibility"
+    if nc -zv localhost $N8N_PORT &>/dev/null; then
+        echo -e " ${GREEN}${CHECK}${NC}"
+    else
+        echo -e " ${RED}${CROSS}${NC}"
+    fi
+    
+    echo ""
+    echo -e "${WHITE}${BOLD}ACCESS INFORMATION${NC}"
+    echo -e "${CYAN}┌────────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC}                                                                    ${CYAN}│${NC}"
+    
+    if [ -n "$N8N_DOMAIN" ] && [ "$ENABLE_SSL" = "true" ]; then
+        echo -e "${CYAN}│${NC}  ${GLOBE} URL: ${GREEN}${BOLD}https://${N8N_DOMAIN}${NC}"
+        printf "${CYAN}│${NC}%-69s${CYAN}│${NC}\n" ""
+    else
+        local SERVER_IP=$(hostname -I | awk '{print $1}')
+        echo -e "${CYAN}│${NC}  ${GLOBE} URL: ${GREEN}${BOLD}http://${SERVER_IP}:${N8N_PORT}${NC}"
+        printf "${CYAN}│${NC}%-69s${CYAN}│${NC}\n" ""
+    fi
+    
+    echo -e "${CYAN}│${NC}                                                                    ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  Method: ${CYAN}${INSTALL_METHOD}${NC}"
+    printf "${CYAN}│${NC}%-69s${CYAN}│${NC}\n" ""
+    echo -e "${CYAN}│${NC}  Port: ${CYAN}${N8N_PORT}${NC}"
+    printf "${CYAN}│${NC}%-69s${CYAN}│${NC}\n" ""
+    echo -e "${CYAN}│${NC}  Status: ${GREEN}Active${NC}"
+    printf "${CYAN}│${NC}%-69s${CYAN}│${NC}\n" ""
+    
+    if [ -n "$BASIC_AUTH_USER" ]; then
+        echo -e "${CYAN}│${NC}  Auth User: ${CYAN}${BASIC_AUTH_USER}${NC}"
+        printf "${CYAN}│${NC}%-69s${CYAN}│${NC}\n" ""
+    fi
+    
+    echo -e "${CYAN}│${NC}                                                                    ${CYAN}│${NC}"
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Useful Commands:${NC}"
+    
+    case $INSTALL_METHOD in
+        docker)
+            echo -e "  Start:   ${CYAN}docker start n8n${NC}"
+            echo -e "  Stop:    ${CYAN}docker stop n8n${NC}"
+            echo -e "  Logs:    ${CYAN}docker logs n8n${NC}"
+            ;;
+        pm2)
+            echo -e "  Start:   ${CYAN}pm2 start n8n${NC}"
+            echo -e "  Stop:    ${CYAN}pm2 stop n8n${NC}"
+            echo -e "  Logs:    ${CYAN}pm2 logs n8n${NC}"
+            ;;
+        systemd)
+            echo -e "  Start:   ${CYAN}systemctl start n8n${NC}"
+            echo -e "  Stop:    ${CYAN}systemctl stop n8n${NC}"
+            echo -e "  Logs:    ${CYAN}journalctl -u n8n -f${NC}"
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# ============================================
+# INSTALLATION HELPERS
+# ============================================
+
+install_dependencies_quiet() {
+    if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+        apt-get update &>/dev/null
+        apt-get install -y curl wget git build-essential net-tools &>/dev/null
+    elif [[ "$OS_TYPE" == "centos" ]] || [[ "$OS_TYPE" == "rhel" ]]; then
+        yum update -y &>/dev/null
+        yum install -y curl wget git net-tools &>/dev/null
+    fi
+}
+
+install_docker_quiet() {
+    if ! command -v docker &>/dev/null; then
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh &>/dev/null
+        sh /tmp/get-docker.sh &>/dev/null
+        systemctl start docker
+        systemctl enable docker &>/dev/null
+    fi
+}
+
+install_nodejs_quiet() {
+    if ! command -v node &>/dev/null || [ $(node -v | sed 's/v//' | cut -d. -f1) -lt 18 ]; then
+        if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+            curl -fsSL https://deb.nodesource.com/setup_18.x | bash - &>/dev/null
+            apt-get install -y nodejs &>/dev/null
+        elif [[ "$OS_TYPE" == "centos" ]] || [[ "$OS_TYPE" == "rhel" ]]; then
+            curl -fsSL https://rpm.nodesource.com/setup_18.x | bash - &>/dev/null
+            yum install -y nodejs &>/dev/null
+        fi
+    fi
+}
+
+install_pm2_quiet() {
+    if ! command -v pm2 &>/dev/null; then
+        npm install -g pm2 &>/dev/null
+    fi
+}
+
+create_n8n_user_quiet() {
+    if ! id "$N8N_USER" &>/dev/null; then
+        useradd -m -d "$N8N_HOME" -s /bin/bash "$N8N_USER"
+    fi
+    mkdir -p "$N8N_HOME/.n8n"
+    touch "$N8N_HOME/.n8n/config"
+    chown -R "$N8N_USER:$N8N_USER" "$N8N_HOME"
+    chmod -R 755 "$N8N_HOME/.n8n"
+}
+
+install_n8n_npm_quiet() {
+    cd "$N8N_HOME"
+    sudo -u "$N8N_USER" npm init -y &>/dev/null
+    sudo -u "$N8N_USER" npm install n8n &>/dev/null
+}
+
+setup_docker_container() {
+    docker pull n8nio/n8n:latest &>/dev/null
+    
+    # Create directory with proper permissions
+    mkdir -p /var/lib/n8n
+    chmod -R 755 /var/lib/n8n
+    
+    local docker_env=""
+    if [ -n "$BASIC_AUTH_USER" ]; then
+        docker_env="-e N8N_BASIC_AUTH_ACTIVE=true -e N8N_BASIC_AUTH_USER=$BASIC_AUTH_USER -e N8N_BASIC_AUTH_PASSWORD=$BASIC_AUTH_PASS"
+    fi
+    
+    # Add timezone
+    docker_env="$docker_env -e GENERIC_TIMEZONE=Asia/Jakarta -e TZ=Asia/Jakarta"
+    
+    # Run as root to avoid permission issues
+    docker run -d \
+        --name n8n \
+        --restart unless-stopped \
+        -p ${N8N_PORT}:5678 \
+        -v /var/lib/n8n:/home/node/.n8n \
+        --user root \
+        $docker_env \
+        n8nio/n8n:latest &>/dev/null
+}
+
+setup_pm2_service() {
+    cat > ${N8N_HOME}/ecosystem.config.js <<EOF
+module.exports = {
+  apps: [{
+    name: 'n8n',
+    script: '${N8N_HOME}/node_modules/n8n/bin/n8n',
+    env: {
+      N8N_PORT: ${N8N_PORT},
+      N8N_HOST: '0.0.0.0',
+      NODE_ENV: 'production'
+    }
+  }]
+};
+EOF
+    chown ${N8N_USER}:${N8N_USER} ${N8N_HOME}/ecosystem.config.js
+    sudo -u ${N8N_USER} pm2 start ${N8N_HOME}/ecosystem.config.js &>/dev/null
+    sudo -u ${N8N_USER} pm2 save &>/dev/null
+    
+    # Setup PM2 to start on boot
+    pm2 startup systemd -u ${N8N_USER} --hp ${N8N_HOME} &>/dev/null
+}
+
+setup_systemd_service() {
+    cat > /etc/systemd/system/n8n.service <<EOF
+[Unit]
+Description=n8n - Workflow Automation Tool
+After=network.target
+
+[Service]
+Type=simple
+User=${N8N_USER}
+Group=${N8N_USER}
+WorkingDirectory=${N8N_HOME}
+Environment="N8N_PORT=${N8N_PORT}"
+Environment="N8N_HOST=0.0.0.0"
+Environment="NODE_ENV=production"
+ExecStart=${N8N_HOME}/node_modules/.bin/n8n
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable n8n &>/dev/null
+    systemctl start n8n
+}
+
+configure_firewall_quiet() {
+    if command -v ufw &>/dev/null; then
+        ufw allow ${N8N_PORT}/tcp &>/dev/null
+    elif command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --permanent --add-port=${N8N_PORT}/tcp &>/dev/null
+        firewall-cmd --reload &>/dev/null
+    elif command -v iptables &>/dev/null; then
+        iptables -A INPUT -p tcp --dport ${N8N_PORT} -j ACCEPT &>/dev/null
+        service iptables save &>/dev/null 2>&1
+    fi
+}
+
+setup_nginx_with_ssl() {
+    # Install nginx and certbot
+    if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+        apt-get install -y nginx certbot python3-certbot-nginx &>/dev/null
+    elif [[ "$OS_TYPE" == "centos" ]] || [[ "$OS_TYPE" == "rhel" ]]; then
+        yum install -y nginx certbot python3-certbot-nginx &>/dev/null
+    fi
+    
+    systemctl start nginx
+    systemctl enable nginx &>/dev/null
+    
+    # Configure nginx
+    cat > /etc/nginx/sites-available/n8n <<EOF
+server {
+    listen 80;
+    server_name $N8N_DOMAIN;
+    
+    location / {
+        proxy_pass http://localhost:$N8N_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_set_header X-Accel-Buffering no;
+    }
+}
+EOF
+    
+    ln -sf /etc/nginx/sites-available/n8n /etc/nginx/sites-enabled/
+    nginx -t &>/dev/null
+    systemctl reload nginx
+    
+    # Get SSL certificate
+    if [ "$ENABLE_SSL" = "true" ] && [ -n "$SSL_EMAIL" ]; then
+        certbot --nginx -d "$N8N_DOMAIN" --non-interactive --agree-tos --email "$SSL_EMAIL" &>/dev/null
+    fi
+}
+
+# ============================================
+# SERVICE CONTROL
+# ============================================
+
+start_n8n() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}STARTING N8N SERVICE${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker start n8n &
+            show_spinner $! "Starting Docker container"
+            ;;
+        pm2)
+            pm2 start n8n &
+            show_spinner $! "Starting PM2 service"
+            ;;
+        systemd)
+            systemctl start n8n &
+            show_spinner $! "Starting systemd service"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${GREEN}Service started successfully!${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+stop_n8n() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}STOPPING N8N SERVICE${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n &
+            show_spinner $! "Stopping Docker container"
+            ;;
+        pm2)
+            pm2 stop n8n &
+            show_spinner $! "Stopping PM2 service"
+            ;;
+        systemd)
+            systemctl stop n8n &
+            show_spinner $! "Stopping systemd service"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${YELLOW}Service stopped${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+restart_n8n() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}RESTARTING N8N SERVICE${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker restart n8n &
+            show_spinner $! "Restarting Docker container"
+            ;;
+        pm2)
+            pm2 restart n8n &
+            show_spinner $! "Restarting PM2 service"
+            ;;
+        systemd)
+            systemctl restart n8n &
+            show_spinner $! "Restarting systemd service"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${GREEN}Service restarted successfully!${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# ============================================
+# SETTINGS MANAGEMENT
+# ============================================
+
+change_settings() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}CHANGE SETTINGS${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Current Configuration:${NC}"
+    echo -e "  ${CYAN}[1]${NC} Port:           ${WHITE}${N8N_PORT}${NC}"
+    echo -e "  ${CYAN}[2]${NC} Domain:         ${WHITE}${N8N_DOMAIN:-Not configured}${NC}"
+    echo -e "  ${CYAN}[3]${NC} SSL:            ${WHITE}${ENABLE_SSL:-false}${NC}"
+    echo -e "  ${CYAN}[4]${NC} Authentication: ${WHITE}${BASIC_AUTH_USER:-Not configured}${NC}"
+    echo -e "  ${CYAN}[5]${NC} Webhook URL:    ${WHITE}${WEBHOOK_URL}${NC}"
+    echo ""
+    echo -e "  ${CYAN}[6]${NC} Environment Variables"
+    echo -e "  ${CYAN}[7]${NC} Database Configuration"
+    echo -e "  ${CYAN}[8]${NC} Email Settings"
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Back to Main Menu"
+    echo ""
+    
+    read -p "  Select setting to change: " setting_choice
+    
+    case $setting_choice in
+        1) change_port ;;
+        2) change_domain ;;
+        3) toggle_ssl ;;
+        4) change_authentication ;;
+        5) change_webhook_url ;;
+        6) configure_env_vars ;;
+        7) configure_database ;;
+        8) configure_email ;;
+        0) return ;;
+        *) invalid_option ;;
+    esac
+    
+    change_settings
+}
+
+# ============================================
+# BACKUP AND RESTORE
+# ============================================
+
+backup_restore_menu() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}BACKUP & RESTORE${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Options:${NC}"
+    echo -e "  ${CYAN}[1]${NC} ${BACKUP} Create Backup"
+    echo -e "  ${CYAN}[2]${NC} ${BACKUP} Restore from Backup"
+    echo -e "  ${CYAN}[3]${NC} ${BACKUP} List Backups"
+    echo -e "  ${CYAN}[4]${NC} ${BACKUP} Delete Old Backups"
+    echo -e "  ${CYAN}[5]${NC} ${SETTINGS} Schedule Automatic Backups"
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Back to Main Menu"
+    echo ""
+    
+    read -p "  Select: " backup_choice
+    
+    case $backup_choice in
+        1) create_backup ;;
+        2) restore_backup ;;
+        3) list_backups ;;
+        4) delete_old_backups ;;
+        5) schedule_backups ;;
+        0) return ;;
+        *) invalid_option ;;
+    esac
+    
+    backup_restore_menu
+}
+
+# ============================================
+# UPDATE N8N
+# ============================================
+
+update_n8n() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}UPDATE N8N${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Checking for updates...${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            echo -n "  Pulling latest image..."
+            docker pull n8nio/n8n:latest &>/dev/null
+            
+            if [ $? -eq 0 ]; then
+                echo -e " ${GREEN}${CHECK}${NC}"
+                
+                echo -n "  Recreating container..."
+                docker stop n8n 2>/dev/null
+                docker rm n8n 2>/dev/null
+                setup_docker_container
+                echo -e " ${GREEN}${CHECK}${NC}"
+                
+                echo ""
+                echo -e "${GREEN}${CHECK} n8n updated successfully!${NC}"
+            else
+                echo -e " ${RED}${CROSS} Failed${NC}"
+            fi
+            ;;
+        pm2)
+            echo -n "  Updating n8n package..."
+            cd "$N8N_HOME"
+            sudo -u "$N8N_USER" npm update n8n &>/dev/null
+            
+            if [ $? -eq 0 ]; then
+                echo -e " ${GREEN}${CHECK}${NC}"
+                
+                echo -n "  Restarting service..."
+                pm2 restart n8n &>/dev/null
+                echo -e " ${GREEN}${CHECK}${NC}"
+                
+                echo ""
+                echo -e "${GREEN}${CHECK} n8n updated successfully!${NC}"
+            else
+                echo -e " ${RED}${CROSS} Failed${NC}"
+            fi
+            ;;
+        systemd)
+            echo -n "  Updating n8n package..."
+            cd "$N8N_HOME"
+            sudo -u "$N8N_USER" npm update n8n &>/dev/null
+            
+            if [ $? -eq 0 ]; then
+                echo -e " ${GREEN}${CHECK}${NC}"
+                
+                echo -n "  Restarting service..."
+                systemctl restart n8n
+                echo -e " ${GREEN}${CHECK}${NC}"
+                
+                echo ""
+                echo -e "${GREEN}${CHECK} n8n updated successfully!${NC}"
+            else
+                echo -e " ${RED}${CROSS} Failed${NC}"
+            fi
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# ============================================
+# UNINSTALL
+# ============================================
+
+uninstall_menu() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}UNINSTALL N8N${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}${BOLD}WARNING: This will remove n8n from your system${NC}"
+    echo ""
+    echo -e "${WHITE}Current Installation:${NC}"
+    echo -e "  Method: ${CYAN}${INSTALL_METHOD}${NC}"
+    echo -e "  Port: ${CYAN}${N8N_PORT}${NC}"
+    echo -e "  Install Date: ${CYAN}${INSTALL_DATE}${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Uninstall Options:${NC}"
+    echo -e "  ${CYAN}[1]${NC} Complete Uninstall (remove everything)"
+    echo -e "  ${CYAN}[2]${NC} Keep Data (remove n8n but keep workflows)"
+    echo -e "  ${CYAN}[3]${NC} Backup & Uninstall"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " uninstall_choice
+    
+    case $uninstall_choice in
+        1) complete_uninstall ;;
+        2) uninstall_keep_data ;;
+        3) backup_and_uninstall ;;
+        0) return ;;
+        *) invalid_option ;;
+    esac
+}
+
+complete_uninstall() {
+    echo ""
+    echo -e "${RED}${BOLD}This will remove all n8n data!${NC}"
+    read -p "  Are you sure? Type 'yes' to confirm: " confirm
+    
+    if [ "$confirm" != "yes" ]; then
+        echo -e "${YELLOW}Uninstall cancelled${NC}"
+        sleep 2
+        return
+    fi
+    
+    echo ""
+    echo -e "${WHITE}${BOLD}UNINSTALLING N8N${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo "  Stopping service..."
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n 2>/dev/null
+            docker rm n8n 2>/dev/null
+            docker rmi n8nio/n8n 2>/dev/null
+            rm -rf /var/lib/n8n
+            ;;
+        pm2)
+            pm2 stop n8n 2>/dev/null
+            pm2 delete n8n 2>/dev/null
+            rm -rf "$N8N_HOME"
+            ;;
+        systemd)
+            systemctl stop n8n 2>/dev/null
+            systemctl disable n8n 2>/dev/null
+            rm -f /etc/systemd/system/n8n.service
+            rm -rf "$N8N_HOME"
+            ;;
+    esac
+    
+    rm -f $CONFIG_FILE
+    rm -f $INSTALL_LOCK
+    
+    echo ""
+    echo -e "${GREEN}${CHECK} n8n has been completely uninstalled${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+    exit 0
+}
+
+# ============================================
+# TOOLS AND UTILITIES
+# ============================================
+
+view_logs() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}N8N LOGS${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker logs n8n --tail 50
+            ;;
+        pm2)
+            pm2 logs n8n --lines 50
+            ;;
+        systemd)
+            journalctl -u n8n -n 50 --no-pager
+            ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+check_port() {
+    print_header
+    echo -e "${WHITE}${BOLD}PORT CHECK${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if load_config 2>/dev/null; then
+        local port=$N8N_PORT
+        echo -e "  Checking configured port: ${CYAN}$port${NC}"
+    else
+        prompt_with_default "Enter port to check" "$DEFAULT_PORT" "port"
+    fi
+    
+    echo ""
+    echo -e "${WHITE}Checking port ${port}:${NC}"
+    echo ""
+    
+    echo -n "  Local binding: "
+    if ss -tuln | grep -q ":$port "; then
+        echo -e "${GREEN}${CHECK} In use${NC}"
+        
+        # Try to identify the process
+        local process=$(lsof -i :$port 2>/dev/null | grep LISTEN | awk '{print $1}' | head -1)
+        if [ -n "$process" ]; then
+            echo -e "  Process: ${CYAN}$process${NC}"
+        fi
+    else
+        echo -e "${GRAY}○ Available${NC}"
+    fi
+    
+    echo -n "  Firewall: "
+    if command -v ufw &>/dev/null && ufw status | grep -q "$port"; then
+        echo -e "${GREEN}${CHECK} Open${NC}"
+    elif command -v firewall-cmd &>/dev/null && firewall-cmd --list-ports | grep -q "$port"; then
+        echo -e "${GREEN}${CHECK} Open${NC}"
+    else
+        echo -e "${YELLOW}⚠ May be blocked${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+test_access() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}TESTING N8N ACCESS${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    local server_ip=$(hostname -I | awk '{print $1}')
+    local public_ip=$(curl -s ifconfig.me 2>/dev/null || echo "N/A")
+    
+    echo -e "${WHITE}Access URLs:${NC}"
+    echo -e "  Local:    ${CYAN}http://localhost:${N8N_PORT}${NC}"
+    echo -e "  Network:  ${CYAN}http://${server_ip}:${N8N_PORT}${NC}"
+    echo -e "  Public:   ${CYAN}http://${public_ip}:${N8N_PORT}${NC}"
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        echo -e "  Domain:   ${CYAN}${N8N_PROTOCOL}://${N8N_DOMAIN}${NC}"
+    fi
+    
+    echo ""
+    echo -e "${WHITE}Testing Connectivity:${NC}"
+    echo ""
+    
+    echo -n "  Local connection: "
+    if curl -s -o /dev/null -w "%{http_code}" http://localhost:${N8N_PORT} 2>/dev/null | grep -q "200\|302"; then
+        echo -e "${GREEN}${CHECK} Working${NC}"
+    else
+        echo -e "${RED}${CROSS} Failed${NC}"
+    fi
+    
+    echo -n "  Port ${N8N_PORT} status: "
+    if nc -zv localhost $N8N_PORT &>/dev/null; then
+        echo -e "${GREEN}${CHECK} Open${NC}"
+    else
+        echo -e "${RED}${CROSS} Closed${NC}"
+    fi
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        echo -n "  Domain access: "
+        if curl -s -o /dev/null -w "%{http_code}" "${N8N_PROTOCOL}://${N8N_DOMAIN}" 2>/dev/null | grep -q "200\|302"; then
+            echo -e "${GREEN}${CHECK} Working${NC}"
+        else
+            echo -e "${RED}${CROSS} Failed${NC}"
+        fi
+    fi
+    
+    echo -n "  External access: "
+    response=$(curl -s -X POST https://ports.yougetsignal.com/check-port.php \
+        -d "remoteAddress=${public_ip}&portNumber=${N8N_PORT}" 2>/dev/null || echo "failed")
+    
+    if [[ "$response" == *"open"* ]]; then
+        echo -e "${GREEN}${CHECK} Accessible${NC}"
+    else
+        echo -e "${YELLOW}⚠ Not accessible from internet${NC}"
+        echo ""
+        echo -e "  ${DIM}Possible reasons:${NC}"
+        echo -e "  ${DIM}• Firewall blocking port ${N8N_PORT}${NC}"
+        echo -e "  ${DIM}• Router not forwarding port${NC}"
+        echo -e "  ${DIM}• ISP blocking incoming connections${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+system_info() {
+    print_header
+    echo -e "${WHITE}${BOLD}SYSTEM INFORMATION${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "  OS:      ${CYAN}${OS_PRETTY}${NC}"
+    echo -e "  Kernel:  ${CYAN}$(uname -r)${NC}"
+    echo -e "  CPU:     ${CYAN}$(lscpu | grep 'Model name' | sed 's/Model name://g' | xargs)${NC}"
+    echo -e "  Cores:   ${CYAN}$(nproc)${NC}"
+    echo -e "  Memory:  ${CYAN}$(free -h | awk '/^Mem:/ {print $2}')${NC}"
+    echo -e "  Used:    ${CYAN}$(free -h | awk '/^Mem:/ {print $3}')${NC}"
+    echo -e "  Disk:    ${CYAN}$(df -h / | awk 'NR==2 {print $2}')${NC}"
+    echo -e "  Used:    ${CYAN}$(df -h / | awk 'NR==2 {print $3}')${NC}"
+    echo -e "  Uptime:  ${CYAN}$(uptime -p)${NC}"
+    
+    echo ""
+    
+    # Check for required software
+    echo -e "${WHITE}Software Status:${NC}"
+    
+    echo -n "  Docker:  "
+    if command -v docker &>/dev/null; then
+        echo -e "${GREEN}Installed ($(docker --version | awk '{print $3}' | sed 's/,//'))${NC}"
+    else
+        echo -e "${RED}Not installed${NC}"
+    fi
+    
+    echo -n "  Node.js: "
+    if command -v node &>/dev/null; then
+        echo -e "${GREEN}Installed ($(node --version))${NC}"
+    else
+        echo -e "${RED}Not installed${NC}"
+    fi
+    
+    echo -n "  PM2:     "
+    if command -v pm2 &>/dev/null; then
+        echo -e "${GREEN}Installed ($(pm2 --version))${NC}"
+    else
+        echo -e "${GRAY}Not installed${NC}"
+    fi
+    
+    echo -n "  Nginx:   "
+    if command -v nginx &>/dev/null; then
+        echo -e "${GREEN}Installed ($(nginx -v 2>&1 | awk '{print $3}' | sed 's/nginx\///'))${NC}"
+    else
+        echo -e "${GRAY}Not installed${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# ============================================
+# SSL MANAGEMENT
+# ============================================
+
+ssl_menu() {
+    load_config
+    print_header
+    echo -e "${WHITE}${BOLD}SSL CERTIFICATE MANAGEMENT${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Current Status:${NC}"
+    echo -e "  SSL Enabled: ${CYAN}${ENABLE_SSL:-false}${NC}"
+    if [ "$ENABLE_SSL" = "true" ]; then
+        echo -e "  Domain:      ${CYAN}${N8N_DOMAIN}${NC}"
+        echo -e "  Email:       ${CYAN}${SSL_EMAIL}${NC}"
+    fi
+    echo ""
+    
+    echo -e "${WHITE}Options:${NC}"
+    echo -e "  ${CYAN}[1]${NC} ${SSL} Install SSL Certificate"
+    echo -e "  ${CYAN}[2]${NC} ${SSL} Renew SSL Certificate"
+    echo -e "  ${CYAN}[3]${NC} ${SSL} Remove SSL Certificate"
+    echo -e "  ${CYAN}[4]${NC} ${SSL} Test SSL Configuration"
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Back to Main Menu"
+    echo ""
+    
+    read -p "  Select: " ssl_choice
+    
+    case $ssl_choice in
+        1) install_ssl_certificate ;;
+        2) renew_ssl_certificate ;;
+        3) remove_ssl_certificate ;;
+        4) test_ssl_configuration ;;
+        0) return ;;
+        *) invalid_option ;;
+    esac
+    
+    ssl_menu
+}
+
+# ============================================
+# ADDITIONAL SETTINGS FUNCTIONS
+# ============================================
+
+change_port() {
+    echo ""
+    echo -e "${WHITE}Change Port${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "  Current port: ${CYAN}${N8N_PORT}${NC}"
+    
+    while true; do
+        prompt_with_default "Enter new port" "$N8N_PORT" "new_port"
+        
+        if validate_port "$new_port"; then
+            break
+        fi
+    done
+    
+    local old_port=$N8N_PORT
+    N8N_PORT=$new_port
+    WEBHOOK_URL=$(echo $WEBHOOK_URL | sed "s/:$old_port/:$new_port/")
+    
+    echo ""
+    echo -e "  Applying changes..."
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n 2>/dev/null
+            docker rm n8n 2>/dev/null
+            
+            # Re-create with new port and root user
+            mkdir -p /var/lib/n8n
+            chmod -R 755 /var/lib/n8n
+            
+            local docker_env=""
+            if [ -n "$BASIC_AUTH_USER" ]; then
+                docker_env="-e N8N_BASIC_AUTH_ACTIVE=true -e N8N_BASIC_AUTH_USER=$BASIC_AUTH_USER -e N8N_BASIC_AUTH_PASSWORD=$BASIC_AUTH_PASS"
+            fi
+            
+            docker_env="$docker_env -e GENERIC_TIMEZONE=Asia/Jakarta -e TZ=Asia/Jakarta"
+            
+            docker run -d \
+                --name n8n \
+                --restart unless-stopped \
+                -p ${N8N_PORT}:5678 \
+                -v /var/lib/n8n:/home/node/.n8n \
+                --user root \
+                $docker_env \
+                n8nio/n8n:latest &>/dev/null
+            ;;
+        pm2)
+            pm2 stop n8n 2>/dev/null
+            pm2 delete n8n 2>/dev/null
+            setup_pm2_service
+            ;;
+        systemd)
+            systemctl stop n8n 2>/dev/null
+            setup_systemd_service
+            systemctl daemon-reload
+            systemctl start n8n
+            ;;
+    esac
+    
+    configure_firewall_quiet
+    save_config
+    
+    echo -e "  ${GREEN}${CHECK} Port changed successfully to ${new_port}${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+change_domain() {
+    echo ""
+    echo -e "${WHITE}Change Domain${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "  Current domain: ${CYAN}${N8N_DOMAIN:-Not configured}${NC}"
+    
+    prompt_with_default "Enter new domain (leave empty to remove)" "" "new_domain"
+    
+    if [ -z "$new_domain" ]; then
+        N8N_DOMAIN=""
+        N8N_PROTOCOL="http"
+        ENABLE_SSL="false"
+        SERVER_IP=$(hostname -I | awk '{print $1}')
+        WEBHOOK_URL="http://${SERVER_IP}:${N8N_PORT}/"
+        
+        rm -f /etc/nginx/sites-enabled/n8n
+        rm -f /etc/nginx/sites-available/n8n
+        systemctl reload nginx 2>/dev/null
+        
+        echo -e "  ${GREEN}${CHECK} Domain removed${NC}"
+    else
+        if validate_domain "$new_domain"; then
+            N8N_DOMAIN=$new_domain
+            
+            echo ""
+            read -p "  Enable SSL for this domain? [Y/n]: " enable_ssl
+            enable_ssl=${enable_ssl:-Y}
+            
+            if [[ "$enable_ssl" =~ ^[Yy]$ ]]; then
+                prompt_with_default "Email for SSL certificate" "$SSL_EMAIL" "SSL_EMAIL"
+                install_ssl_certificate
+            else
+                N8N_PROTOCOL="http"
+                WEBHOOK_URL="http://${N8N_DOMAIN}/"
+            fi
+        fi
+    fi
+    
+    save_config
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+toggle_ssl() {
+    echo ""
+    
+    if [ "$ENABLE_SSL" = "true" ]; then
+        echo -e "${WHITE}Disable SSL?${NC}"
+        read -p "  Confirm [y/N]: " confirm
+        
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            ENABLE_SSL="false"
+            N8N_PROTOCOL="http"
+            
+            if [ -n "$N8N_DOMAIN" ]; then
+                setup_nginx_without_ssl
+            fi
+            
+            save_config
+            echo -e "  ${GREEN}${CHECK} SSL disabled${NC}"
+        fi
+    else
+        if [ -z "$N8N_DOMAIN" ]; then
+            echo -e "${YELLOW}Domain required for SSL. Please configure domain first.${NC}"
+        else
+            install_ssl_certificate
+        fi
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+change_authentication() {
+    echo ""
+    echo -e "${WHITE}Authentication Settings${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if [ -n "$BASIC_AUTH_USER" ]; then
+        echo -e "  Current user: ${CYAN}${BASIC_AUTH_USER}${NC}"
+        echo ""
+        echo -e "  ${CYAN}[1]${NC} Change credentials"
+        echo -e "  ${CYAN}[2]${NC} Disable authentication"
+        echo -e "  ${CYAN}[0]${NC} Cancel"
+        echo ""
+        
+        read -p "  Select: " auth_choice
+        
+        case $auth_choice in
+            1)
+                prompt_with_default "New username" "$BASIC_AUTH_USER" "BASIC_AUTH_USER"
+                read -s -p "  New password: " BASIC_AUTH_PASS
+                echo ""
+                
+                apply_env_var "N8N_BASIC_AUTH_ACTIVE" "true"
+                apply_env_var "N8N_BASIC_AUTH_USER" "$BASIC_AUTH_USER"
+                apply_env_var "N8N_BASIC_AUTH_PASSWORD" "$BASIC_AUTH_PASS"
+                
+                save_config
+                echo -e "  ${GREEN}${CHECK} Authentication updated${NC}"
+                ;;
+            2)
+                BASIC_AUTH_USER=""
+                BASIC_AUTH_PASS=""
+                
+                apply_env_var "N8N_BASIC_AUTH_ACTIVE" "false"
+                
+                save_config
+                echo -e "  ${GREEN}${CHECK} Authentication disabled${NC}"
+                ;;
+            0) return ;;
+        esac
+    else
+        echo -e "  Authentication is currently disabled"
+        echo ""
+        read -p "  Enable authentication? [y/N]: " enable_auth
+        
+        if [[ "$enable_auth" =~ ^[Yy]$ ]]; then
+            prompt_with_default "Username" "" "BASIC_AUTH_USER"
+            read -s -p "  Password: " BASIC_AUTH_PASS
+            echo ""
+            
+            apply_env_var "N8N_BASIC_AUTH_ACTIVE" "true"
+            apply_env_var "N8N_BASIC_AUTH_USER" "$BASIC_AUTH_USER"
+            apply_env_var "N8N_BASIC_AUTH_PASSWORD" "$BASIC_AUTH_PASS"
+            
+            save_config
+            echo -e "  ${GREEN}${CHECK} Authentication enabled${NC}"
+        fi
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+change_webhook_url() {
+    echo ""
+    echo -e "${WHITE}Change Webhook URL${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "  Current URL: ${CYAN}${WEBHOOK_URL}${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} Use default (auto-detect)"
+    echo -e "  ${CYAN}[2]${NC} Custom URL"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " url_choice
+    
+    case $url_choice in
+        1)
+            if [ -n "$N8N_DOMAIN" ]; then
+                WEBHOOK_URL="${N8N_PROTOCOL}://${N8N_DOMAIN}/"
+            else
+                SERVER_IP=$(hostname -I | awk '{print $1}')
+                WEBHOOK_URL="http://${SERVER_IP}:${N8N_PORT}/"
+            fi
+            
+            apply_env_var "WEBHOOK_URL" "$WEBHOOK_URL"
+            save_config
+            
+            echo -e "  ${GREEN}${CHECK} Using default: ${WEBHOOK_URL}${NC}"
+            ;;
+        2)
+            prompt_with_default "Enter custom webhook URL" "$WEBHOOK_URL" "custom_url"
+            WEBHOOK_URL=$custom_url
+            
+            apply_env_var "WEBHOOK_URL" "$WEBHOOK_URL"
+            save_config
+            
+            echo -e "  ${GREEN}${CHECK} Webhook URL updated${NC}"
+            ;;
+        0) return ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+configure_env_vars() {
+    echo ""
+    echo -e "${WHITE}Environment Variables${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Common Variables:${NC}"
+    echo -e "  ${CYAN}[1]${NC} Executions Process Mode"
+    echo -e "  ${CYAN}[2]${NC} Timezone"
+    echo -e "  ${CYAN}[3]${NC} Custom Variables"
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Back"
+    echo ""
+    
+    read -p "  Select: " env_choice
+    
+    case $env_choice in
+        1)
+            echo ""
+            echo -e "  Executions Process Mode:"
+            echo -e "  ${CYAN}[1]${NC} regular (default)"
+            echo -e "  ${CYAN}[2]${NC} main (all in main process)"
+            read -p "  Select: " mode_choice
+            
+            case $mode_choice in
+                1) EXECUTIONS_MODE="regular" ;;
+                2) EXECUTIONS_MODE="main" ;;
+            esac
+            
+            apply_env_var "EXECUTIONS_PROCESS" "$EXECUTIONS_MODE"
+            ;;
+        2)
+            echo ""
+            prompt_with_default "Enter timezone (e.g., Asia/Jakarta)" "Asia/Jakarta" "timezone"
+            apply_env_var "GENERIC_TIMEZONE" "$timezone"
+            apply_env_var "TZ" "$timezone"
+            ;;
+        3)
+            echo ""
+            echo -e "  Enter custom environment variable"
+            prompt_with_default "Variable name" "" "var_name"
+            prompt_with_default "Variable value" "" "var_value"
+            apply_env_var "$var_name" "$var_value"
+            ;;
+        0) return ;;
+    esac
+    
+    echo -e "  ${GREEN}${CHECK} Environment variable updated${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+configure_database() {
+    echo ""
+    echo -e "${WHITE}Database Configuration${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Select Database Type:${NC}"
+    echo -e "  ${CYAN}[1]${NC} SQLite (default)"
+    echo -e "  ${CYAN}[2]${NC} PostgreSQL"
+    echo -e "  ${CYAN}[3]${NC} MySQL/MariaDB"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " db_choice
+    
+    case $db_choice in
+        1)
+            echo -e "  ${GREEN}${CHECK} Using SQLite (default)${NC}"
+            ;;
+        2)
+            echo ""
+            echo -e "${WHITE}PostgreSQL Configuration:${NC}"
+            prompt_with_default "Host" "localhost" "pg_host"
+            prompt_with_default "Port" "5432" "pg_port"
+            prompt_with_default "Database name" "" "pg_database"
+            prompt_with_default "Username" "" "pg_user"
+            read -s -p "  Password: " pg_password
+            echo ""
+            
+            apply_env_var "DB_TYPE" "postgresdb"
+            apply_env_var "DB_POSTGRESDB_HOST" "$pg_host"
+            apply_env_var "DB_POSTGRESDB_PORT" "$pg_port"
+            apply_env_var "DB_POSTGRESDB_DATABASE" "$pg_database"
+            apply_env_var "DB_POSTGRESDB_USER" "$pg_user"
+            apply_env_var "DB_POSTGRESDB_PASSWORD" "$pg_password"
+            
+            echo -e "  ${GREEN}${CHECK} PostgreSQL configured${NC}"
+            ;;
+        3)
+            echo ""
+            echo -e "${WHITE}MySQL/MariaDB Configuration:${NC}"
+            prompt_with_default "Host" "localhost" "mysql_host"
+            prompt_with_default "Port" "3306" "mysql_port"
+            prompt_with_default "Database name" "" "mysql_database"
+            prompt_with_default "Username" "" "mysql_user"
+            read -s -p "  Password: " mysql_password
+            echo ""
+            
+            apply_env_var "DB_TYPE" "mysqldb"
+            apply_env_var "DB_MYSQLDB_HOST" "$mysql_host"
+            apply_env_var "DB_MYSQLDB_PORT" "$mysql_port"
+            apply_env_var "DB_MYSQLDB_DATABASE" "$mysql_database"
+            apply_env_var "DB_MYSQLDB_USER" "$mysql_user"
+            apply_env_var "DB_MYSQLDB_PASSWORD" "$mysql_password"
+            
+            echo -e "  ${GREEN}${CHECK} MySQL/MariaDB configured${NC}"
+            ;;
+        0) return ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+configure_email() {
+    echo ""
+    echo -e "${WHITE}Email Configuration${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}SMTP Settings:${NC}"
+    prompt_with_default "SMTP Host" "" "smtp_host"
+    prompt_with_default "SMTP Port" "587" "smtp_port"
+    prompt_with_default "SMTP User" "" "smtp_user"
+    read -s -p "  SMTP Password: " smtp_pass
+    echo ""
+    prompt_with_default "From Email" "" "from_email"
+    prompt_with_default "From Name" "n8n" "from_name"
+    
+    echo ""
+    echo -e "  Use SSL/TLS?"
+    echo -e "  ${CYAN}[1]${NC} Yes (recommended)"
+    echo -e "  ${CYAN}[2]${NC} No"
+    read -p "  Select: " ssl_choice
+    
+    if [ "$ssl_choice" = "1" ]; then
+        smtp_ssl="true"
+    else
+        smtp_ssl="false"
+    fi
+    
+    apply_env_var "N8N_EMAIL_MODE" "smtp"
+    apply_env_var "N8N_SMTP_HOST" "$smtp_host"
+    apply_env_var "N8N_SMTP_PORT" "$smtp_port"
+    apply_env_var "N8N_SMTP_USER" "$smtp_user"
+    apply_env_var "N8N_SMTP_PASS" "$smtp_pass"
+    apply_env_var "N8N_SMTP_SENDER" "$from_email"
+    apply_env_var "N8N_SMTP_SSL" "$smtp_ssl"
+    
+    echo ""
+    echo -e "  ${GREEN}${CHECK} Email configuration saved${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+apply_env_var() {
+    local var_name=$1
+    local var_value=$2
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n 2>/dev/null
+            docker rm n8n 2>/dev/null
+            
+            # Re-create with environment variable and root user
+            mkdir -p /var/lib/n8n
+            chmod -R 755 /var/lib/n8n
+            
+            local docker_env="-e ${var_name}=${var_value}"
+            if [ -n "$BASIC_AUTH_USER" ]; then
+                docker_env="$docker_env -e N8N_BASIC_AUTH_ACTIVE=true -e N8N_BASIC_AUTH_USER=$BASIC_AUTH_USER -e N8N_BASIC_AUTH_PASSWORD=$BASIC_AUTH_PASS"
+            fi
+            
+            docker_env="$docker_env -e GENERIC_TIMEZONE=Asia/Jakarta -e TZ=Asia/Jakarta"
+            
+            docker run -d \
+                --name n8n \
+                --restart unless-stopped \
+                -p ${N8N_PORT}:5678 \
+                -v /var/lib/n8n:/home/node/.n8n \
+                --user root \
+                $docker_env \
+                n8nio/n8n:latest &>/dev/null
+            ;;
+        pm2)
+            sed -i "/env: {/a\\      ${var_name}: '${var_value}'," ${N8N_HOME}/ecosystem.config.js
+            pm2 restart n8n
+            ;;
+        systemd)
+            sed -i "/\[Service\]/a\\Environment=\"${var_name}=${var_value}\"" /etc/systemd/system/n8n.service
+            systemctl daemon-reload
+            systemctl restart n8n
+            ;;
+    esac
+}
+
+# ============================================
+# BACKUP FUNCTIONS
+# ============================================
+
+create_backup() {
+    echo ""
+    echo -e "${WHITE}Creating Backup...${NC}"
+    echo ""
+    
+    local backup_name="n8n-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    local backup_path="${BACKUP_DIR}/${backup_name}"
+    
+    echo -n "  Stopping n8n service..."
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n 2>/dev/null
+            ;;
+        pm2)
+            pm2 stop n8n 2>/dev/null
+            ;;
+        systemd)
+            systemctl stop n8n 2>/dev/null
+            ;;
+    esac
+    echo -e " ${GREEN}${CHECK}${NC}"
+    
+    echo -n "  Creating backup..."
+    
+    case $INSTALL_METHOD in
+        docker)
+            tar -czf "$backup_path" -C /var/lib n8n 2>/dev/null
+            ;;
+        *)
+            tar -czf "$backup_path" -C "$N8N_HOME" .n8n 2>/dev/null
+            ;;
+    esac
+    
+    if [ $? -eq 0 ]; then
+        echo -e " ${GREEN}${CHECK}${NC}"
+        local backup_size=$(du -h "$backup_path" | cut -f1)
+        echo -e "  Backup created: ${CYAN}${backup_name}${NC}"
+        echo -e "  Size: ${CYAN}${backup_size}${NC}"
+        echo -e "  Location: ${CYAN}${backup_path}${NC}"
+    else
+        echo -e " ${RED}${CROSS} Failed${NC}"
+    fi
+    
+    echo -n "  Restarting n8n service..."
+    case $INSTALL_METHOD in
+        docker)
+            docker start n8n 2>/dev/null
+            ;;
+        pm2)
+            pm2 start n8n 2>/dev/null
+            ;;
+        systemd)
+            systemctl start n8n 2>/dev/null
+            ;;
+    esac
+    echo -e " ${GREEN}${CHECK}${NC}"
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+restore_backup() {
+    echo ""
+    echo -e "${WHITE}Select Backup to Restore:${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if [ ! -d "$BACKUP_DIR" ] || [ ! "$(ls -A $BACKUP_DIR 2>/dev/null)" ]; then
+        echo -e "  ${GRAY}No backups found${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    local backups=($(ls -t $BACKUP_DIR/*.tar.gz 2>/dev/null))
+    local i=1
+    
+    for backup in "${backups[@]}"; do
+        local backup_name=$(basename "$backup")
+        local backup_size=$(du -h "$backup" | cut -f1)
+        local backup_date=$(stat -c %y "$backup" | cut -d' ' -f1,2 | cut -d'.' -f1)
+        
+        echo -e "  ${CYAN}[$i]${NC} $backup_name"
+        echo -e "      Size: $backup_size | Date: $backup_date"
+        ((i++))
+    done
+    
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select backup to restore: " backup_choice
+    
+    if [ "$backup_choice" = "0" ]; then
+        return
+    fi
+    
+    if [ "$backup_choice" -lt 1 ] || [ "$backup_choice" -gt "${#backups[@]}" ]; then
+        echo -e "${RED}Invalid selection${NC}"
+        sleep 2
+        return
+    fi
+    
+    local selected_backup="${backups[$((backup_choice-1))]}"
+    
+    echo ""
+    echo -e "${YELLOW}Warning: This will overwrite current n8n data!${NC}"
+    read -p "  Continue? [y/N]: " confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -e "${WHITE}Restoring from backup...${NC}"
+    echo ""
+    
+    echo -n "  Stopping n8n service..."
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n 2>/dev/null
+            ;;
+        pm2)
+            pm2 stop n8n 2>/dev/null
+            ;;
+        systemd)
+            systemctl stop n8n 2>/dev/null
+            ;;
+    esac
+    echo -e " ${GREEN}${CHECK}${NC}"
+    
+    echo -n "  Restoring data..."
+    
+    case $INSTALL_METHOD in
+        docker)
+            rm -rf /var/lib/n8n/*
+            tar -xzf "$selected_backup" -C /var/lib/ 2>/dev/null
+            ;;
+        *)
+            rm -rf "$N8N_HOME/.n8n"
+            tar -xzf "$selected_backup" -C "$N8N_HOME/" 2>/dev/null
+            chown -R "$N8N_USER:$N8N_USER" "$N8N_HOME/.n8n"
+            ;;
+    esac
+    
+    if [ $? -eq 0 ]; then
+        echo -e " ${GREEN}${CHECK}${NC}"
+    else
+        echo -e " ${RED}${CROSS} Failed${NC}"
+    fi
+    
+    echo -n "  Restarting n8n service..."
+    case $INSTALL_METHOD in
+        docker)
+            docker start n8n 2>/dev/null
+            ;;
+        pm2)
+            pm2 start n8n 2>/dev/null
+            ;;
+        systemd)
+            systemctl start n8n 2>/dev/null
+            ;;
+    esac
+    echo -e " ${GREEN}${CHECK}${NC}"
+    
+    echo ""
+    echo -e "${GREEN}${CHECK} Backup restored successfully!${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+list_backups() {
+    echo ""
+    echo -e "${WHITE}Available Backups:${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if [ -d "$BACKUP_DIR" ] && [ "$(ls -A $BACKUP_DIR 2>/dev/null)" ]; then
+        local i=1
+        for backup in $(ls -t $BACKUP_DIR/*.tar.gz 2>/dev/null); do
+            local backup_name=$(basename "$backup")
+            local backup_size=$(du -h "$backup" | cut -f1)
+            local backup_date=$(stat -c %y "$backup" | cut -d' ' -f1,2 | cut -d'.' -f1)
+            
+            echo -e "  ${CYAN}[$i]${NC} $backup_name"
+            echo -e "      Size: $backup_size | Date: $backup_date"
+            ((i++))
+        done
+    else
+        echo -e "  ${GRAY}No backups found${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+delete_old_backups() {
+    echo ""
+    echo -e "${WHITE}Delete Old Backups${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "  ${CYAN}[1]${NC} Delete backups older than 7 days"
+    echo -e "  ${CYAN}[2]${NC} Delete backups older than 30 days"
+    echo -e "  ${CYAN}[3]${NC} Keep only last 5 backups"
+    echo -e "  ${CYAN}[4]${NC} Delete all backups"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " delete_choice
+    
+    case $delete_choice in
+        1)
+            find $BACKUP_DIR -name "*.tar.gz" -mtime +7 -delete
+            echo -e "  ${GREEN}${CHECK} Deleted backups older than 7 days${NC}"
+            ;;
+        2)
+            find $BACKUP_DIR -name "*.tar.gz" -mtime +30 -delete
+            echo -e "  ${GREEN}${CHECK} Deleted backups older than 30 days${NC}"
+            ;;
+        3)
+            ls -t $BACKUP_DIR/*.tar.gz 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null
+            echo -e "  ${GREEN}${CHECK} Kept only last 5 backups${NC}"
+            ;;
+        4)
+            echo ""
+            echo -e "${RED}This will delete ALL backups!${NC}"
+            read -p "  Are you sure? Type 'yes' to confirm: " confirm
+            if [ "$confirm" = "yes" ]; then
+                rm -f $BACKUP_DIR/*.tar.gz
+                echo -e "  ${GREEN}${CHECK} All backups deleted${NC}"
+            else
+                echo -e "  ${YELLOW}Cancelled${NC}"
+            fi
+            ;;
+        0) return ;;
+    esac
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+schedule_backups() {
+    echo ""
+    echo -e "${WHITE}Schedule Automatic Backups${NC}"
+    echo -e "${GRAY}─────────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    echo -e "${WHITE}Backup Schedule:${NC}"
+    echo -e "  ${CYAN}[1]${NC} Daily at 2:00 AM"
+    echo -e "  ${CYAN}[2]${NC} Weekly (Sunday at 2:00 AM)"
+    echo -e "  ${CYAN}[3]${NC} Monthly (1st day at 2:00 AM)"
+    echo -e "  ${CYAN}[4]${NC} Custom schedule"
+    echo -e "  ${CYAN}[5]${NC} Disable automatic backups"
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    
+    read -p "  Select: " schedule_choice
+    
+    local cron_schedule=""
+    
+    case $schedule_choice in
+        1) cron_schedule="0 2 * * *" ;;
+        2) cron_schedule="0 2 * * 0" ;;
+        3) cron_schedule="0 2 1 * *" ;;
+        4)
+            echo ""
+            echo -e "  Enter cron schedule (e.g., '0 2 * * *' for daily at 2 AM)"
+            read -p "  Schedule: " cron_schedule
+            ;;
+        5)
+            crontab -l 2>/dev/null | grep -v "n8n-backup" | crontab -
+            echo -e "  ${GREEN}${CHECK} Automatic backups disabled${NC}"
+            echo ""
+            read -p "Press Enter to continue..."
+            return
+            ;;
+        0) return ;;
+    esac
+    
+    if [ -n "$cron_schedule" ]; then
+        cat > /usr/local/bin/n8n-backup.sh <<'EOF'
+#!/bin/bash
+source /etc/n8n-installer/config.conf
+BACKUP_DIR="/var/backups/n8n"
+backup_name="n8n-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+backup_path="${BACKUP_DIR}/${backup_name}"
+
+case $INSTALL_METHOD in
+    docker)
+        docker stop n8n 2>/dev/null
+        tar -czf "$backup_path" -C /var/lib n8n 2>/dev/null
+        docker start n8n 2>/dev/null
+        ;;
+    *)
+        tar -czf "$backup_path" -C "$N8N_HOME" .n8n 2>/dev/null
+        ;;
+esac
+
+ls -t $BACKUP_DIR/*.tar.gz 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null
+EOF
+        
+        chmod +x /usr/local/bin/n8n-backup.sh
+        
+        (crontab -l 2>/dev/null | grep -v "n8n-backup"; echo "$cron_schedule /usr/local/bin/n8n-backup.sh") | crontab -
+        
+        echo -e "  ${GREEN}${CHECK} Automatic backups scheduled${NC}"
+        echo -e "  Schedule: ${CYAN}${cron_schedule}${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# ============================================
+# SSL FUNCTIONS
+# ============================================
+
+install_ssl_certificate() {
+    echo ""
+    
+    if [ -z "$N8N_DOMAIN" ]; then
+        echo -e "${YELLOW}No domain configured. Please configure a domain first.${NC}"
+        prompt_with_default "Enter domain name" "" "N8N_DOMAIN"
+        
+        if [ -z "$N8N_DOMAIN" ]; then
+            echo -e "${RED}Domain is required for SSL${NC}"
+            sleep 2
+            return
+        fi
+    fi
+    
+    if [ -z "$SSL_EMAIL" ]; then
+        prompt_with_default "Email for SSL certificate" "" "SSL_EMAIL"
+    fi
+    
+    echo ""
+    echo -e "${WHITE}Installing SSL Certificate...${NC}"
+    echo ""
+    
+    echo -n "  Installing Certbot..."
+    if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+        apt-get install -y certbot python3-certbot-nginx &>/dev/null
+    elif [[ "$OS_TYPE" == "centos" ]] || [[ "$OS_TYPE" == "rhel" ]]; then
+        yum install -y certbot python3-certbot-nginx &>/dev/null
+    fi
+    echo -e " ${GREEN}${CHECK}${NC}"
+    
+    echo -n "  Installing Nginx..."
+    if [[ "$OS_TYPE" == "ubuntu" ]] || [[ "$OS_TYPE" == "debian" ]]; then
+        apt-get install -y nginx &>/dev/null
+    elif [[ "$OS_TYPE" == "centos" ]] || [[ "$OS_TYPE" == "rhel" ]]; then
+        yum install -y nginx &>/dev/null
+    fi
+    systemctl start nginx
+    systemctl enable nginx &>/dev/null
+    echo -e " ${GREEN}${CHECK}${NC}"
+    
+    echo -n "  Configuring Nginx..."
+    setup_nginx_with_ssl
+    echo -e " ${GREEN}${CHECK}${NC}"
+    
+    echo -n "  Obtaining SSL certificate..."
+    certbot --nginx -d "$N8N_DOMAIN" --non-interactive --agree-tos --email "$SSL_EMAIL" &>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo -e " ${GREEN}${CHECK}${NC}"
+        ENABLE_SSL="true"
+        N8N_PROTOCOL="https"
+        save_config
+        
+        echo ""
+        echo -e "${GREEN}${CHECK} SSL certificate installed successfully!${NC}"
+        echo -e "  Access n8n at: ${CYAN}https://${N8N_DOMAIN}${NC}"
+    else
+        echo -e " ${RED}${CROSS} Failed${NC}"
+        echo -e "${RED}Failed to obtain SSL certificate${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+renew_ssl_certificate() {
+    echo ""
+    echo -e "${WHITE}Renewing SSL Certificate...${NC}"
+    echo ""
+    
+    if [ "$ENABLE_SSL" != "true" ] || [ -z "$N8N_DOMAIN" ]; then
+        echo -e "${YELLOW}SSL is not configured${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    echo -n "  Renewing certificate..."
+    certbot renew --nginx -d "$N8N_DOMAIN" --non-interactive &>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo -e " ${GREEN}${CHECK}${NC}"
+        echo -e "  ${GREEN}${CHECK} Certificate renewed successfully${NC}"
+    else
+        echo -e " ${RED}${CROSS}${NC}"
+        echo -e "  ${RED}Failed to renew certificate${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+remove_ssl_certificate() {
+    echo ""
+    echo -e "${YELLOW}Remove SSL Certificate?${NC}"
+    echo -e "This will disable HTTPS access"
+    read -p "  Continue? [y/N]: " confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+    
+    echo ""
+    echo -n "  Removing certificate..."
+    
+    if [ -n "$N8N_DOMAIN" ]; then
+        certbot delete --cert-name "$N8N_DOMAIN" --non-interactive &>/dev/null
+    fi
+    
+    setup_nginx_without_ssl
+    
+    ENABLE_SSL="false"
+    N8N_PROTOCOL="http"
+    save_config
+    
+    echo -e " ${GREEN}${CHECK}${NC}"
+    echo -e "  ${GREEN}${CHECK} SSL certificate removed${NC}"
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+test_ssl_configuration() {
+    echo ""
+    echo -e "${WHITE}Testing SSL Configuration...${NC}"
+    echo ""
+    
+    if [ "$ENABLE_SSL" != "true" ] || [ -z "$N8N_DOMAIN" ]; then
+        echo -e "${YELLOW}SSL is not configured${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    echo -e "  Domain: ${CYAN}${N8N_DOMAIN}${NC}"
+    echo ""
+    
+    echo -n "  HTTPS connection: "
+    if curl -s -o /dev/null -w "%{http_code}" "https://${N8N_DOMAIN}" 2>/dev/null | grep -q "200\|302"; then
+        echo -e "${GREEN}${CHECK} Working${NC}"
+    else
+        echo -e "${RED}${CROSS} Failed${NC}"
+    fi
+    
+    echo -n "  Certificate status: "
+    expiry=$(echo | openssl s_client -servername "$N8N_DOMAIN" -connect "${N8N_DOMAIN}:443" 2>/dev/null | openssl x509 -noout -dates 2>/dev/null | grep notAfter | cut -d= -f2)
+    
+    if [ -n "$expiry" ]; then
+        echo -e "${GREEN}${CHECK} Valid until $expiry${NC}"
+    else
+        echo -e "${RED}${CROSS} Could not verify${NC}"
+    fi
+    
+    echo -n "  HTTP to HTTPS redirect: "
+    redirect=$(curl -s -o /dev/null -w "%{http_code}" -L "http://${N8N_DOMAIN}" 2>/dev/null)
+    
+    if [ "$redirect" = "200" ] || [ "$redirect" = "302" ]; then
+        echo -e "${GREEN}${CHECK} Working${NC}"
+    else
+        echo -e "${RED}${CROSS} Not working${NC}"
+    fi
+    
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+setup_nginx_without_ssl() {
+    cat > /etc/nginx/sites-available/n8n <<EOF
+server {
+    listen 80;
+    server_name $N8N_DOMAIN;
+    
+    location / {
+        proxy_pass http://localhost:$N8N_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+    
+    ln -sf /etc/nginx/sites-available/n8n /etc/nginx/sites-enabled/
+    nginx -t &>/dev/null
+    systemctl reload nginx
+}
+
+# ============================================
+# UNINSTALL FUNCTIONS (CONTINUED)
+# ============================================
+
+uninstall_keep_data() {
+    echo ""
+    echo -e "${YELLOW}This will remove n8n but keep your workflows${NC}"
+    read -p "  Continue? [Y/n]: " confirm
+    confirm=${confirm:-Y}
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+    
+    echo ""
+    echo "  Removing n8n (keeping data)..."
+    
+    case $INSTALL_METHOD in
+        docker)
+            docker stop n8n 2>/dev/null
+            docker rm n8n 2>/dev/null
+            docker rmi n8nio/n8n 2>/dev/null
+            echo -e "  ${GREEN}${CHECK} Data preserved in /var/lib/n8n${NC}"
+            ;;
+        pm2)
+            pm2 stop n8n 2>/dev/null
+            pm2 delete n8n 2>/dev/null
+            echo -e "  ${GREEN}${CHECK} Data preserved in ${N8N_HOME}/.n8n${NC}"
+            ;;
+        systemd)
+            systemctl stop n8n 2>/dev/null
+            systemctl disable n8n 2>/dev/null
+            rm -f /etc/systemd/system/n8n.service
+            echo -e "  ${GREEN}${CHECK} Data preserved in ${N8N_HOME}/.n8n${NC}"
+            ;;
+    esac
+    
+    rm -f $CONFIG_FILE
+    rm -f $INSTALL_LOCK
+    
+    echo ""
+    echo -e "${GREEN}${CHECK} n8n removed but data preserved${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+    exit 0
+}
+
+backup_and_uninstall() {
+    echo ""
+    echo -e "${WHITE}Creating backup before uninstall...${NC}"
+    
+    create_backup
+    
+    echo ""
+    echo -e "${YELLOW}Backup created. Proceed with uninstall?${NC}"
+    read -p "  Continue? [Y/n]: " confirm
+    confirm=${confirm:-Y}
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+    
+    complete_uninstall
+}
+
+# ============================================
+# MAIN EXECUTION
+# ============================================
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}This script must be run as root${NC}"
+    echo -e "${YELLOW}Please run: sudo $0${NC}"
+    exit 1
+fi
+
+# Initialize and start
+detect_os
+show_main_menu
