@@ -74,7 +74,7 @@ print_header() {
     echo ""
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
-  echo -e "${CYAN}║${NC}         ${MAGENTA}${BOLD}n8n ${WHITE}AUTOMATION ${GREEN}INSTALLER${NC}  ${DIM}v5.5${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}         ${MAGENTA}${BOLD}n8n ${WHITE}AUTOMATION ${GREEN}INSTALLER${NC}  ${DIM}v5.9${NC}                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                     ${YELLOW}by Vinz${NC}                                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════════╝${NC}"
@@ -1049,12 +1049,20 @@ exit_script() {
 }
 
 # Check root
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}This script must be run as root${NC}"
-    echo -e "${YELLOW}Please run: sudo $0${NC}"
-    exit 1
-fi
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}This script must be run as root${NC}"
+        echo -e "${YELLOW}Please run: sudo $0${NC}"
+        exit 1
+    fi
+}
 
 # Main execution
-detect_os
-show_main_menu
+main() {
+    check_root
+    detect_os
+    show_main_menu
+}
+
+# Start the script
+main "$@"
