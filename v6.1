@@ -93,7 +93,7 @@ print_header() {
     echo ""
     echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}         ${MAGENTA}${BOLD}n8n ${WHITE}AUTOMATION ${GREEN}INSTALLER${NC}  ${DIM}v6.0${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}         ${MAGENTA}${BOLD}n8n ${WHITE}AUTOMATION ${GREEN}INSTALLER${NC}  ${DIM}v6.1${NC}                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                     ${YELLOW}by Vinz${NC}                                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}                                                                       ${CYAN}║${NC}"
     echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════════╝${NC}"
@@ -1046,6 +1046,21 @@ exit_script() {
     exit 0
 }
 
+# Make script globally accessible
+install_script_globally() {
+    local install_path="/usr/local/bin/n8n-manager"
+    
+    # Only install if not already installed or if different
+    if [[ ! -f "$install_path" ]] || [[ ! "$0" -ef "$install_path" ]]; then
+        echo -e "${CYAN}Installing script globally...${NC}"
+        cp "$0" "$install_path"
+        chmod +x "$install_path"
+        echo -e "${GREEN}Script installed to: $install_path${NC}"
+        echo -e "${GREEN}You can now run it from anywhere using: n8n-manager${NC}"
+        sleep 2
+    fi
+}
+
 # Check root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -1059,6 +1074,13 @@ check_root() {
 main() {
     check_root
     detect_os
+    
+    # Install script globally for easy access
+    install_script_globally
+    
+    # Always work from a consistent directory
+    cd /root
+    
     show_main_menu
 }
 
